@@ -46,6 +46,39 @@ def latest(repo, asset_name, timeout=10):
             "notes": (rel.get("body") or "").strip()}
 
 
+def notes_since(repo, after_build, upto_build=None, limit=15, timeout=10):
+    """Описания сборок новее after_build: [(номер, текст), …] — от новой к старой."""
+    req = urllib.request.Request(f"https://api.github.com/repos/{repo}/releases?per_page=30",
+                                 headers={"User-Agent": UA, "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        rels = json.loads(r.read().decode("utf-8"))
+    out = []
+    for rel in rels:
+        m = re.search(r"(\d+)\s*$", rel.get("tag_name") or "")
+        if not m:
+            continue
+        b = int(m.group(1))
+        if b > after_build and (upto_build is None or b <= upto_build):
+            out.append((b, clean_notes(rel.get("body") or "")))
+    out.sort(reverse=True)
+    return out[:limit]
+
+
+def clean_notes(body):
+    """Из описания релиза — только пункты «что нового» (без строки про скачивание)."""
+    lines = []
+    for ln in body.splitlines():
+        t = ln.strip()
+        if not t or t.lower().startswith(("скачай", "download")):
+            continue
+        if t.lower().startswith("сборка №") and ":" in t:        # старый формат описания
+            t = "• " + t.split(":", 1)[1].strip()
+        if t[0] in "-*•":
+            t = "• " + t.lstrip("-*• ").strip()
+        lines.append(t)
+    return "\n".join(lines)
+
+
 def download(url, dest, size=0, progress=None):
     req = urllib.request.Request(url, headers={"User-Agent": UA})
     tmp = dest + ".part"

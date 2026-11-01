@@ -18,6 +18,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # история и теги — для списка «что нового»
 
       - uses: actions/setup-python@v5
         with:
@@ -75,7 +77,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8     # русские описания коммитов
           $tag = "build-${{ github.run_number }}"
-          $msg = git log -1 --pretty=%s
-          $notes = "Сборка №${{ github.run_number }}: $msg`n`nСкачай Music-Discord.exe и запусти. Обновление: закрой старую (трей → Выход) и замени exe — настройки сохранятся."
-          gh release create $tag dist\Music-Discord.exe --title "Music → Discord — сборка ${{ github.run_number }}" --notes $notes --latest
+          $prev = gh release view --json tagName -q .tagName 2>$null
+          if ($LASTEXITCODE -eq 0 -and $prev) { $log = git log "$prev..HEAD" --no-merges --pretty=format:%s }
+          else { $log = git log -1 --pretty=format:%s }
+          $items = @($log | Where-Object { $_ -and $_ -notmatch '^(Тест|тест|Test|test|CI|ci|Merge|WIP)' } | Select-Object -Unique | ForEach-Object { "- $_" })
+          if ($items.Count -eq 0) { $items = @("- Мелкие исправления") }
+          $notes = ($items -join "`n") + "`n`nСкачай Music-Discord.exe и запусти."
+          $notes | Out-File notes.md -Encoding utf8
+          gh release create $tag dist\Music-Discord.exe --title "Music → Discord — сборка ${{ github.run_number }}" --notes-file notes.md --latest
