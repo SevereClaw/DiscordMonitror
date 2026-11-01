@@ -29,6 +29,8 @@ import uuid
 import webbrowser
 from tkinter import messagebox
 
+import updater
+
 try:
     from winrt.windows.media.control import \
         GlobalSystemMediaTransportControlsSessionManager as MediaManager
@@ -44,6 +46,8 @@ except Exception:
     HAS_TRAY = False
 
 APP_NAME = "Music → Discord"
+UPDATE_REPO = "SevereClaw/DiscordMonitror"
+UPDATE_ASSET = "Music-Discord.exe"
 CFG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "VLCDiscord")
 CFG_PATH = os.path.join(CFG_DIR, "config.json")
 VLCRC = os.path.join(os.environ.get("APPDATA", ""), "vlc", "vlcrc")
@@ -59,6 +63,8 @@ DEFAULT_CFG = {
     "show_delay": 10,           # показывать новый трек, только если он играет столько секунд
     "lyrics": "off",            # текст песни: off | details | state
     "autostart": False,
+    "auto_update": True,        # сама ставит новые сборки с GitHub
+    "update_checked": 0,
     "buttons": ["youtube", "yandex"],
     "hotkey": "Ctrl+Alt+H",
     "blacklist": [],
@@ -1707,6 +1713,11 @@ class Tray:
                                  radio=True)
                 for key, text in MULTI_MODES.items()])),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem(lambda it: app.update_menu_text(),
+                             lambda i, it: q.put({"cmd": "check_update", "manual": True})),
+            pystray.MenuItem("Обновляться автоматически", lambda i, it: q.put({"cmd": "toggle_auto_update"}),
+                             checked=lambda it: app.cfg.get("auto_update", True)),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("Выход", lambda i, it: q.put({"cmd": "quit"})),
         )
         self.icon = pystray.Icon("MusicDiscord", img, APP_NAME, menu)
@@ -1766,7 +1777,9 @@ class App(tk.Tk):
         self.lastfm = LastFM(self.cfg, self.history)
         self.hist_period = "week"
 
-        self.title(APP_NAME)
+        self.build = updater.current_build()
+        self.update_state = ""            # "", "checking", "downloading 42%", "ready N", "latest"
+        self.title(APP_NAME + (f" · сборка {self.build}" if self.build else ""))
         self.geometry("540x790")
         self.minsize(540, 790)
         try:
@@ -1781,6 +1794,7 @@ class App(tk.Tk):
         self.build_tabs()
 
         self.after(200, self.poll)
+        self.after(20000, self.update_tick)
         self.register_hotkey(silent=True)
         self.tray = None
         if HAS_TRAY:
@@ -1799,6 +1813,8 @@ class App(tk.Tk):
                 self.withdraw()
             else:
                 self.iconify()
+        if "--updated" in sys.argv and self.tray:
+            self.after(2500, lambda: self.tray.notify(f"Обновлено до сборки {self.build}."))
 
     # ── шапка ──
     def build_header(self):
@@ -2627,6 +2643,26 @@ class App(tk.Tk):
                 if cmd == "quit":
                     self.quit_app()
                     return
+                if cmd == "check_update":
+                    self.check_update(manual=msg.get("manual", False))
+                    continue
+                if cmd == "toggle_auto_update":
+                    self.cfg["auto_update"] = not self.cfg.get("auto_update", True)
+                    save_cfg(self.cfg)
+                    if self.tray:
+                        self.tray.refresh()
+                    continue
+                if cmd == "update_msg":
+                    if self.tray and msg.get("text"):
+                        self.tray.notify(msg["text"])
+                    elif msg.get("text"):
+                        messagebox.showinfo(APP_NAME, msg["text"])
+                    if self.tray:
+                        self.tray.refresh()
+                    continue
+                if cmd == "update_ready":
+                    self.install_update(msg["path"], msg["build"])
+                    return
                 if not self.worker:
                     continue
                 self.set_state(msg["state"], msg["text"])
@@ -2659,6 +2695,71 @@ class App(tk.Tk):
                 self.tray.notify("Я в трее возле часов. Правый клик — меню и выход.")
                 self.cfg["tray_hint_shown"] = True
                 save_cfg(self.cfg)
+            return
+        self.quit_app()
+
+    # ------------------------------------------------------------ автообновление
+    def update_menu_text(self):
+        st = self.update_state
+        if st.startswith("downloading"):
+            return f"Скачиваю обновление… {st.split()[-1]}"
+        if st == "checking":
+            return "Проверяю обновления…"
+        return f"Проверить обновления (сборка {self.build or '—'})"
+
+    def update_tick(self):
+        if updater.can_update() and self.cfg.get("auto_update", True) \
+                and updater.due(self.cfg.get("update_checked"), hours=6):
+            self.check_update(manual=False)
+        self.after(30 * 60 * 1000, self.update_tick)
+
+    def check_update(self, manual=False):
+        if not updater.can_update():
+            if manual:
+                messagebox.showinfo(APP_NAME, "Обновление работает только в собранной программе "
+                                              "из релизов GitHub.")
+            return
+        if self.update_state in ("checking",) or self.update_state.startswith("downloading"):
+            return
+        self.update_state = "checking"
+        threading.Thread(target=self._update_worker, args=(manual,), daemon=True).start()
+
+    def _update_worker(self, manual):
+        q = self.q
+        try:
+            rel = updater.latest(UPDATE_REPO, UPDATE_ASSET)
+            self.cfg["update_checked"] = time.time()
+            if not rel or rel["build"] <= self.build:
+                self.update_state = "latest"
+                if manual:
+                    q.put({"cmd": "update_msg", "text": f"У тебя последняя версия (сборка {self.build})."})
+                return
+            if not manual and not self.cfg.get("auto_update", True):
+                self.update_state = ""
+                return
+            q.put({"cmd": "update_msg", "text": f"Вышла сборка {rel['build']} — скачиваю и обновлюсь сам."})
+            dest = os.path.join(updater.work_dir("MusicDiscord"), f"Music-Discord-{rel['build']}.exe")
+
+            def prog(p):
+                self.update_state = f"downloading {int(p)}%"
+            updater.download(rel["url"], dest, rel["size"], prog)
+            self.update_state = f"ready {rel['build']}"
+            q.put({"cmd": "update_ready", "path": dest, "build": rel["build"]})
+        except Exception as e:
+            self.update_state = ""
+            if manual:
+                q.put({"cmd": "update_msg", "text": f"Не удалось проверить обновление: {e}"})
+
+    def install_update(self, path, build):
+        save_cfg(self.cfg)
+        try:
+            hidden = self.state() in ("withdrawn", "iconic")
+            updater.apply_exe(path, "MusicDiscord",
+                              restart_args=(["--minimized"] if hidden else []) + ["--updated"])
+        except Exception as e:
+            self.update_state = ""
+            messagebox.showerror(APP_NAME, f"Не удалось обновиться: {e}")
+            self.after(200, self.poll)
             return
         self.quit_app()
 

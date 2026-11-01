@@ -4,3 +4,4 @@ build/
 dist/
 *.spec
 Music-Discord.exe
+build_info.py

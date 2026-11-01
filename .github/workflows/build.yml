@@ -28,7 +28,16 @@ jobs:
         run: python -m pip install --upgrade pip pyinstaller -r requirements.txt
 
       - name: Check the code compiles
-        run: python -m py_compile vlc_discord.py
+        run: python -m py_compile vlc_discord.py updater.py
+
+      - name: Updater self-test (replaces files like a real update)
+        run: |
+          python tests/test_updater.py start
+          python tests/test_updater.py check
+
+      - name: Stamp build number (for auto-update)
+        shell: pwsh
+        run: Set-Content -Path build_info.py -Value "BUILD = ${{ github.run_number }}" -Encoding ascii
 
       - name: Build
         run: >
@@ -41,6 +50,7 @@ jobs:
           --hidden-import winrt.windows.foundation.collections
           --hidden-import winrt.windows.storage.streams
           --hidden-import winrt.windows.security.cryptography
+          --hidden-import updater --hidden-import build_info
           --log-level WARN
           vlc_discord.py
 
