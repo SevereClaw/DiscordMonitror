@@ -85,57 +85,89 @@ def _clean_env():
     return env
 
 
-def _ps_quote(s):
-    return "'" + str(s).replace("'", "''") + "'"
-
-
-def _run_script(body, app):
-    path = os.path.join(work_dir(app), "apply.ps1")
-    with open(path, "w", encoding="utf-8-sig") as f:      # BOM — чтобы PowerShell 5 понял кириллицу
-        f.write(body)
-    flags = 0x00000008 | 0x00000200 | 0x08000000          # DETACHED | NEW_GROUP | NO_WINDOW
-    subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                      "-WindowStyle", "Hidden", "-File", path],
-                     env=_clean_env(), creationflags=flags, close_fds=True,
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-
-_WAIT = """$ErrorActionPreference = 'SilentlyContinue'
-$log = Join-Path (Split-Path $PSCommandPath) 'apply.log'
-"start $(Get-Date)" | Out-File $log
+_SCRIPT = r"""$ErrorActionPreference = 'Continue'
+$here = Split-Path -LiteralPath $PSCommandPath
+$log = Join-Path $here 'apply.log'
+function Log($t) { Add-Content -LiteralPath $log -Value $t -Encoding UTF8 }
+Set-Content -LiteralPath $log -Value "start $(Get-Date)" -Encoding UTF8
+$p = Get-Content -LiteralPath (Join-Path $here 'apply.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $deadline = (Get-Date).AddSeconds(60)
-while ((Get-Process -Id {pid} -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) {{
-    Start-Sleep -Milliseconds 300 }}
-Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue
+while ((Get-Process -Id $p.pid -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) {
+    Start-Sleep -Milliseconds 300 }
+Stop-Process -Id $p.pid -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 800
+$ok = $false
+if ($p.mode -eq 'exe') {
+    for ($i = 0; $i -lt 20 -and -not $ok; $i++) {
+        try { Copy-Item -LiteralPath $p.src -Destination $p.target -Force -ErrorAction Stop; $ok = $true }
+        catch { Log "copy: $_"; Start-Sleep -Milliseconds 700 }
+    }
+    if ($ok) { Remove-Item -LiteralPath $p.src -Force -ErrorAction SilentlyContinue }
+} else {
+    $dst = $p.dir
+    $int = Join-Path $dst '_internal'
+    $old = Join-Path $dst '_internal.old'
+    if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction SilentlyContinue }
+    for ($i = 0; $i -lt 15 -and -not $ok; $i++) {
+        try {
+            if (Test-Path -LiteralPath $int) { Rename-Item -LiteralPath $int '_internal.old' -ErrorAction Stop }
+            Get-ChildItem -LiteralPath $p.src -Force | ForEach-Object {
+                Copy-Item -LiteralPath $_.FullName -Destination $dst -Recurse -Force -ErrorAction Stop }
+            $ok = $true
+        } catch {
+            Log "copy: $_"
+            if (-not (Test-Path -LiteralPath $int) -and (Test-Path -LiteralPath $old)) {
+                Rename-Item -LiteralPath $old '_internal' -ErrorAction SilentlyContinue }
+            Start-Sleep -Milliseconds 800
+        }
+    }
+    if ($ok) {
+        Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $p.src -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+Log "copied: $ok"
+if ($p.restart) {
+    if ($p.args.Count -gt 0) { Start-Process -FilePath $p.target -ArgumentList $p.args }
+    else { Start-Process -FilePath $p.target }
+    Log 'restarted'
+}
 """
+
+
+def _run_script(params, app):
+    """Скрипт — только латиница; пути (бывают по-русски) — в apply.json в UTF-8."""
+    d = work_dir(app)
+    with open(os.path.join(d, "apply.json"), "w", encoding="utf-8") as f:
+        json.dump(params, f, ensure_ascii=False)
+    path = os.path.join(d, "apply.ps1")
+    with open(path, "w", encoding="ascii", newline="\r\n") as f:
+        f.write(_SCRIPT)
+    cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", path]
+    base = 0x00000008 | 0x00000200 | 0x08000000          # DETACHED | NEW_GROUP | NO_WINDOW
+    for flags in (base | 0x01000000, base):              # + BREAKAWAY_FROM_JOB, если можно
+        try:
+            subprocess.Popen(cmd, env=_clean_env(), creationflags=flags, close_fds=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            return path
+        except OSError:
+            continue
+    raise OSError("не удалось запустить PowerShell")
 
 
 def apply_exe(new_exe, app, restart_args=(), restart=True):
     """Один exe (Music → Discord): заменить и перезапустить."""
-    target = sys.executable
-    args = " ".join(_ps_quote(a) for a in restart_args)
-    start = (f"Start-Process -FilePath {_ps_quote(target)} " + (f"-ArgumentList {args}" if args else "")
-             if restart else "")
-    body = _WAIT.format(pid=os.getpid()) + f"""
-$ok = $false
-for ($i = 0; $i -lt 20 -and -not $ok; $i++) {{
-    try {{ Copy-Item -LiteralPath {_ps_quote(new_exe)} -Destination {_ps_quote(target)} -Force -ErrorAction Stop; $ok = $true }}
-    catch {{ "copy: $_" | Out-File $log -Append; Start-Sleep -Milliseconds 700 }}
-}}
-"copied: $ok" | Out-File $log -Append
-{start}
-if ($ok) {{ Remove-Item -LiteralPath {_ps_quote(new_exe)} -Force }}
-"""
-    _run_script(body, app)
+    return _run_script({"mode": "exe", "pid": os.getpid(), "src": os.path.abspath(new_exe),
+                        "target": sys.executable, "restart": bool(restart),
+                        "args": list(restart_args)}, app)
 
 
 def unpack_folder(zip_path, app, exe_name):
     """Распаковать архив сборки «папкой»; вернуть папку, где лежит exe."""
+    import shutil
     dest = os.path.join(work_dir(app), "new")
-    if os.path.isdir(dest):
-        import shutil
-        shutil.rmtree(dest, ignore_errors=True)
+    shutil.rmtree(dest, ignore_errors=True)
     with zipfile.ZipFile(zip_path) as z:
         z.extractall(dest)
     for root, _dirs, files in os.walk(dest):
@@ -147,32 +179,9 @@ def unpack_folder(zip_path, app, exe_name):
 def apply_folder(new_dir, app, exe_name, restart_args=(), restart=True):
     """Сборка папкой (MP3 Плеер): заменить содержимое папки программы и перезапустить."""
     app_dir = os.path.dirname(sys.executable)
-    target = os.path.join(app_dir, exe_name)
-    args = " ".join(_ps_quote(a) for a in restart_args)
-    start = (f"Start-Process -FilePath {_ps_quote(target)} " + (f"-ArgumentList {args}" if args else "")
-             if restart else "")
-    body = _WAIT.format(pid=os.getpid()) + f"""
-$src = {_ps_quote(new_dir)}
-$dst = {_ps_quote(app_dir)}
-$old = Join-Path $dst '_internal.old'
-Remove-Item -LiteralPath $old -Recurse -Force
-$ok = $false
-for ($i = 0; $i -lt 15 -and -not $ok; $i++) {{
-    try {{
-        if (Test-Path (Join-Path $dst '_internal')) {{ Rename-Item -LiteralPath (Join-Path $dst '_internal') '_internal.old' -ErrorAction Stop }}
-        Copy-Item -Path (Join-Path $src '*') -Destination $dst -Recurse -Force -ErrorAction Stop
-        $ok = $true
-    }} catch {{
-        "copy: $_" | Out-File $log -Append
-        if (-not (Test-Path (Join-Path $dst '_internal')) -and (Test-Path $old)) {{ Rename-Item -LiteralPath $old '_internal' }}
-        Start-Sleep -Milliseconds 800
-    }}
-}}
-"copied: $ok" | Out-File $log -Append
-if ($ok) {{ Remove-Item -LiteralPath $old -Recurse -Force; Remove-Item -LiteralPath $src -Recurse -Force }}
-{start}
-"""
-    _run_script(body, app)
+    return _run_script({"mode": "folder", "pid": os.getpid(), "src": os.path.abspath(new_dir),
+                        "dir": app_dir, "target": os.path.join(app_dir, exe_name),
+                        "restart": bool(restart), "args": list(restart_args)}, app)
 
 
 def due(last_check, hours=6):
