@@ -71,7 +71,12 @@ def check():
             ps1 = os.path.join(updater.work_dir(name), "apply.ps1")
             print(name, "apply.ps1 exists:", os.path.isfile(ps1))
             if os.path.isfile(ps1):
-                r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1],
+                body = open(ps1, encoding="utf-8-sig").read()
+                print("---- script ----\n" + body + "\n----")
+                dbg = ps1[:-4] + "-debug.ps1"
+                with open(dbg, "w", encoding="utf-8-sig") as f:
+                    f.write(body.replace("'SilentlyContinue'", "'Continue'"))
+                r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", dbg],
                                    capture_output=True, text=True, timeout=120)
                 print("rc", r.returncode, "\nstdout:", r.stdout[-2000:], "\nstderr:", r.stderr[-3000:])
     if os.path.exists(os.path.join(APP, "_internal", "gone.dll")):
