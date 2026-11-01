@@ -1,0 +1,69 @@
+name: Build Music-Discord
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip pyinstaller -r requirements.txt
+
+      - name: Check the code compiles
+        run: python -m py_compile vlc_discord.py
+
+      - name: Build
+        run: >
+          python -m PyInstaller --noconfirm --clean --onefile --noconsole
+          --name Music-Discord --icon icon.ico --add-data "icon.ico;."
+          --collect-all winrt
+          --hidden-import winrt.windows.media.control
+          --hidden-import pystray._win32
+          --hidden-import winrt.windows.foundation
+          --hidden-import winrt.windows.foundation.collections
+          --hidden-import winrt.windows.storage.streams
+          --hidden-import winrt.windows.security.cryptography
+          --log-level WARN
+          vlc_discord.py
+
+      - name: Smoke test - the exe starts and keeps running
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist\Music-Discord.exe" -PassThru
+          Start-Sleep -Seconds 15
+          if ($p.HasExited) { Write-Error "Music-Discord.exe closed by itself (code $($p.ExitCode))"; exit 1 }
+          Stop-Process -Id $p.Id -Force
+          Write-Host "OK: Music-Discord.exe runs"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Music-Discord
+          path: dist/Music-Discord.exe
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "build-${{ github.run_number }}"
+          $msg = git log -1 --pretty=%s
+          $notes = "Сборка №${{ github.run_number }}: $msg`n`nСкачай Music-Discord.exe и запусти. Обновление: закрой старую (трей → Выход) и замени exe — настройки сохранятся."
+          gh release create $tag dist\Music-Discord.exe --title "Music → Discord — сборка ${{ github.run_number }}" --notes $notes --latest
