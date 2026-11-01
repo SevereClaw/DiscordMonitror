@@ -41,6 +41,19 @@ def start():
     write(new_exe, "new")
     sys.executable = EXE1
     updater.apply_exe(new_exe, "upd-test-exe", restart=False)
+    # эксперимент: какие флаги запуска работают
+    import subprocess
+    V = {"detached+group+nowin+breakaway": 0x08|0x200|0x08000000|0x01000000,
+         "detached+group+nowin": 0x08|0x200|0x08000000,
+         "detached": 0x08, "nowin+group": 0x200|0x08000000, "nowin": 0x08000000, "none": 0}
+    for name, fl in V.items():
+        mark = os.path.join(ROOT, "mark-" + name.replace("+", "_") + ".txt")
+        try:
+            subprocess.Popen(["powershell", "-NoProfile", "-Command", f"Set-Content -LiteralPath '{mark}' 'ok'"],
+                             creationflags=fl, close_fds=True, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as e:
+            print(name, "Popen failed", e)
     print("scripts started")
 
 
@@ -60,6 +73,9 @@ def check():
         if ok:
             break
         time.sleep(1)
+    for f in sorted(os.listdir(ROOT)):
+        if f.startswith("mark-"):
+            print("marker:", f)
     for name in ("upd-test-folder", "upd-test-exe"):
         log = os.path.join(updater.work_dir(name), "apply.log")
         if os.path.isfile(log):
@@ -79,6 +95,8 @@ def check():
                                    capture_output=True, timeout=120)
                 print("rc", r.returncode, "\nstdout:", r.stdout.decode("oem", "replace")[-3000:],
                       "\nstderr:", r.stderr.decode("oem", "replace")[-3000:])
+        bad = [p for p, v in want.items() if not (os.path.isfile(p) and read(p) == v)]
+        print("after manual run, still bad:", bad)
     if os.path.exists(os.path.join(APP, "_internal", "gone.dll")):
         bad.append("старый _internal не убран")
     if os.path.exists(os.path.join(APP, "_internal.old")):
