@@ -31,6 +31,8 @@ jobs:
         run: python -m py_compile vlc_discord.py updater.py
 
       - name: Updater self-test (replaces files like a real update)
+        env:
+          PYTHONIOENCODING: utf-8
         run: |
           python tests/test_updater.py start
           python tests/test_updater.py check
