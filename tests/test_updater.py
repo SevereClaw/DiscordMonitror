@@ -77,8 +77,9 @@ def check():
                 with open(dbg, "w", encoding="utf-8-sig") as f:
                     f.write(body.replace("'SilentlyContinue'", "'Continue'"))
                 r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", dbg],
-                                   capture_output=True, text=True, timeout=120)
-                print("rc", r.returncode, "\nstdout:", r.stdout[-2000:], "\nstderr:", r.stderr[-3000:])
+                                   capture_output=True, timeout=120)
+                print("rc", r.returncode, "\nstdout:", r.stdout.decode("oem", "replace")[-3000:],
+                      "\nstderr:", r.stderr.decode("oem", "replace")[-3000:])
     if os.path.exists(os.path.join(APP, "_internal", "gone.dll")):
         bad.append("старый _internal не убран")
     if os.path.exists(os.path.join(APP, "_internal.old")):
