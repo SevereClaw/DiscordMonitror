@@ -652,6 +652,29 @@ def image_ok(url):
     return not t or time.time() - t > 600
 
 
+# ───────────────────────── своя обложка для трека / альбома ─────────────────────────
+def _ckey(*parts):
+    return "|".join(re.sub(r"\s+", " ", (p or "").casefold().replace("ё", "е")).strip() for p in parts)
+
+
+def cover_keys(track):
+    """Ключи «трек» и «альбом» для словаря custom_covers."""
+    t = "t:" + _ckey(track.get("artist"), track.get("title"))
+    a = "a:" + _ckey(track.get("artist"), track.get("album")) if (track.get("album") or "").strip() else None
+    return t, a
+
+
+def custom_cover(cfg, track):
+    """(картинка, 'трек'/'альбом') — заданная вручную, или (None, None)."""
+    cc = cfg.get("custom_covers") or {}
+    t, a = cover_keys(track)
+    if cc.get(t):
+        return cc[t], "трек"
+    if a and cc.get(a):
+        return cc[a], "альбом"
+    return None, None
+
+
 class DiscordIPC:
     def __init__(self, client_id, pid=None):
         self.client_id = client_id
@@ -876,14 +899,19 @@ def build_activity(track, cfg, lyric=None):
         c = FILE_COVERS.url_for(track["cover_file"], track.get("cover_hash"))
         return c if c and image_ok(c) else None
 
-    for get in ((from_file, web) if file_first else (web, from_file)):
+    mine, scope = custom_cover(cfg, track)
+    if mine:                                       # своя картинка — всегда главнее
+        act["assets"]["large_image"] = mine
+        COVER_SRC["last"] = f"своя ({scope})"
+    for get in (() if mine else (from_file, web) if file_first else (web, from_file)):
         cover = get()
         if cover:
             act["assets"]["large_image"] = cover
             COVER_SRC["last"] = "из файла" if get is from_file else "iTunes"
             break
     else:
-        COVER_SRC["last"] = ""
+        if not mine:
+            COVER_SRC["last"] = ""
     fallback = (cfg.get("fallback_image") or "").strip()
     if fallback and "large_image" not in act["assets"]:
         act["assets"]["large_image"] = fallback
@@ -1393,7 +1421,7 @@ class Worker(threading.Thread):
         if self.cfg.get("file_covers", True) and track.get("cover_file"):
             file_cover = FILE_COVERS.url_for(track["cover_file"], track.get("cover_hash"))
         key = (track["src"], track["title"], track["artist"], track["playing"], file_cover,
-               bool(file_cover) and image_ok(file_cover))
+               bool(file_cover) and image_ok(file_cover), self.cfg.get("cover_rev", 0))
         start = int(time.time()) - track["time"]
         seeked = (track["length"] > 0 and self.last_start is not None
                   and abs(start - self.last_start) > 3)
@@ -1408,7 +1436,9 @@ class Worker(threading.Thread):
             note += f"\n♪ {self.last_lyric}"
         if is_video(track) and not track.get("cover_file"):
             note += " · превью: " + (THUMB_STATUS["error"][:50] or "нет")
-        if COVER_SRC["last"] == "iTunes" and not is_video(track):
+        if COVER_SRC["last"].startswith("своя") and not is_video(track):
+            note += f" · обложка: {COVER_SRC['last']} ✓"
+        elif COVER_SRC["last"] == "iTunes" and not is_video(track):
             note += " · обложка: iTunes ✓"
         elif track.get("cover_file") and self.cfg.get("file_covers", True):
             note += " · " + ("превью" if is_video(track) else "обложка из файла") + (
@@ -1715,6 +1745,7 @@ class Tray:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(lambda it: app.update_menu_text(),
                              lambda i, it: q.put({"cmd": "check_update", "manual": True})),
+            pystray.MenuItem("Что нового", lambda i, it: q.put({"cmd": "whats_new"})),
             pystray.MenuItem("Обновляться автоматически", lambda i, it: q.put({"cmd": "toggle_auto_update"}),
                              checked=lambda it: app.cfg.get("auto_update", True)),
             pystray.Menu.SEPARATOR,
@@ -1750,6 +1781,140 @@ class Tray:
             self.icon.stop()
         except Exception:
             pass
+
+
+# ───────────────────────── своя обложка: окно ─────────────────────────
+class CoverDialog(tk.Toplevel):
+    def __init__(self, app, track):
+        super().__init__(app)
+        self.app, self.track = app, dict(track)
+        self.title("Своя обложка")
+        self.configure(bg=C["bg"])
+        self.resizable(False, False)
+        self.transient(app)
+        try:
+            self.iconbitmap(resource("icon.ico"))
+        except Exception:
+            pass
+        box = tk.Frame(self, bg=C["panel"], padx=16, pady=14, highlightthickness=1,
+                       highlightbackground=C["line"])
+        box.pack(fill="both", expand=True, padx=12, pady=12)
+        name = f"{track.get('artist') or '—'} — {track.get('title') or '—'}"
+        tk.Label(box, text=name, bg=C["panel"], fg=C["cream"], font=(SERIF, 12, "bold"),
+                 wraplength=420, justify="left", anchor="w").pack(fill="x")
+        mine, scope = custom_cover(app.cfg, track)
+        now = f"Сейчас: своя ({scope})" if mine else f"Сейчас: {COVER_SRC['last'] or 'нет картинки'}"
+        tk.Label(box, text=now, bg=C["panel"], fg=C["muted"], font=(SANS, 9), anchor="w").pack(fill="x")
+
+        tk.Label(box, text="Ссылка на картинку (https://…) или имя картинки из Art Assets:",
+                 bg=C["panel"], fg=C["cream"], font=(SANS, 10), anchor="w").pack(fill="x", pady=(12, 2))
+        self.var = tk.StringVar(value=mine or "")
+        ent = tk.Entry(box, textvariable=self.var, bg=C["panel2"], fg=C["cream"],
+                       insertbackground=C["cream"], relief="flat", font=(SANS, 10), width=52)
+        ent.pack(fill="x", ipady=4)
+        ent.focus_set()
+        tk.Label(box, text="Подсказка: найди обложку в интернете → правый клик → «Копировать адрес "
+                           "картинки». Надёжнее всего — картинка из Art Assets твоего приложения "
+                           "на discord.com/developers (её Discord показывает всегда).",
+                 bg=C["panel"], fg=C["muted"], font=(SANS, 8), wraplength=420, justify="left",
+                 anchor="w").pack(fill="x", pady=(4, 0))
+
+        has_album = bool((track.get("album") or "").strip())
+        self.scope = tk.StringVar(value=("album" if (scope == "альбом" or (not mine and has_album)) else "track"))
+        srow = tk.Frame(box, bg=C["panel"])
+        srow.pack(fill="x", pady=(10, 0))
+        for val, text in (("album", f"Для всего альбома «{track.get('album')}»" if has_album else "Для альбома (нет в тегах)"),
+                          ("track", "Только для этого трека")):
+            rb = tk.Radiobutton(srow, text=text, variable=self.scope, value=val, bg=C["panel"], fg=C["cream"],
+                                selectcolor=C["panel2"], activebackground=C["panel"], activeforeground=C["cream"],
+                                font=(SANS, 10), anchor="w")
+            if val == "album" and not has_album:
+                rb.config(state="disabled")
+            rb.pack(fill="x")
+
+        self.msg = tk.Label(box, text="", bg=C["panel"], fg=C["glow"], font=(SANS, 9), wraplength=420,
+                            justify="left", anchor="w")
+        self.msg.pack(fill="x", pady=(8, 0))
+        row = tk.Frame(box, bg=C["panel"])
+        row.pack(fill="x", pady=(10, 0))
+        PButton(row, "Сохранить", self.save, accent=True).pack(side="left", fill="x", expand=True, padx=(0, 6))
+        PButton(row, "Файл с компьютера…", self.pick_file).pack(side="left", padx=(0, 6))
+        if mine:
+            PButton(row, "Убрать свою", self.remove).pack(side="left")
+        self.bind("<Return>", lambda e: self.save())
+        self.bind("<Escape>", lambda e: self.destroy())
+
+    def _done(self, text, close=False):
+        if not self.winfo_exists():
+            return
+        self.msg.config(text=text)
+        if close:
+            self.after(900, self.destroy)
+
+    def save(self):
+        val = self.var.get().strip()
+        if not val:
+            self._done("Вставь ссылку или выбери файл.")
+            return
+        if not val.lower().startswith("http"):                 # имя из Art Assets
+            self.app.set_custom_cover(self.track, val, self.scope.get())
+            self._done("Сохранено ✓ (картинка из Art Assets)", close=True)
+            return
+        self._done("Проверяю, что Discord сможет открыть картинку…")
+
+        def work():
+            ok = check_image_url(val)
+            self.after(0, lambda: self._saved(val, ok))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _saved(self, url, ok):
+        if not ok:
+            self._done("По этой ссылке не картинка (или сайт не пускает Discord). Нужна прямая ссылка "
+                       "на .jpg/.png — «Копировать адрес картинки».")
+            return
+        self.app.set_custom_cover(self.track, url, self.scope.get())
+        self._done("Сохранено ✓ — в статусе обновится через пару секунд", close=True)
+
+    def pick_file(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(parent=self, title="Картинка для обложки",
+                                          filetypes=[("Картинки", "*.jpg *.jpeg *.png *.webp"), ("Все файлы", "*.*")])
+        if not path:
+            return
+        self._done("Загружаю картинку на catbox.moe (навсегда)…")
+
+        def work():
+            url, err = upload_permanent(path)
+            self.after(0, lambda: (self.var.set(url), self._saved(url, True)) if url
+                       else self._done(f"Не получилось загрузить: {err}"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def remove(self):
+        self.app.set_custom_cover(self.track, None, None)
+        self._done("Своя обложка убрана — снова как обычно", close=True)
+
+
+def upload_permanent(path):
+    """Загрузить картинку на catbox.moe (без срока) → (ссылка, ошибка)."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        return None, str(e)
+    ext = os.path.splitext(path)[1].lower() or ".jpg"
+    mime = {".png": "image/png", ".webp": "image/webp"}.get(ext, "image/jpeg")
+    body, ctype = _multipart({"reqtype": "fileupload"}, "fileToUpload", "cover" + ext, data, mime)
+    try:
+        req = urllib.request.Request("https://catbox.moe/user/api.php", data=body, method="POST")
+        req.add_header("Content-Type", ctype)
+        req.add_header("User-Agent", "MusicDiscord/1.0")
+        with urllib.request.urlopen(req, timeout=30) as r:
+            link = r.read().decode("utf-8", "replace").strip()
+    except Exception as e:
+        return None, str(e)[:120]
+    if not link.startswith("https://"):
+        return None, link[:120]
+    return (link, "") if check_image_url(link) else (None, "хостинг не отдаёт картинку")
 
 
 # ───────────────────────── интерфейс ─────────────────────────
@@ -1795,6 +1960,7 @@ class App(tk.Tk):
 
         self.after(200, self.poll)
         self.after(20000, self.update_tick)
+        self.after(4000, self.check_whats_new)
         self.register_hotkey(silent=True)
         self.tray = None
         if HAS_TRAY:
@@ -1868,7 +2034,8 @@ class App(tk.Tk):
         self.start_btn = PButton(row, "▶  Начать", self.toggle, accent=True)
         self.start_btn.pack(side="left", fill="x", expand=True, padx=(0, 6))
         self.hide_btn = PButton(row, "◐  Невидимка", self.toggle_hidden)
-        self.hide_btn.pack(side="left", fill="x", expand=True)
+        self.hide_btn.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        PButton(row, "🖼  Обложка", self.open_cover_dialog).pack(side="left")
         self.hk_hint = tk.Label(box, text="", bg=C["panel"], fg=C["muted"], font=(SANS, 8))
         self.hk_hint.pack(anchor="e", pady=(4, 0))
         self.update_hk_hint()
@@ -2548,6 +2715,31 @@ class App(tk.Tk):
             "вписанное ниже (по умолчанию youtube).\n"
             "Если значка для приложения нет в списке — ставится твой логотип.")
 
+    def open_cover_dialog(self):
+        tr = self.current
+        if not tr or not (tr.get("title") or tr.get("artist")):
+            messagebox.showinfo("Своя обложка", "Сначала включи музыку — обложка задаётся для того, "
+                                                "что сейчас играет.")
+            return
+        CoverDialog(self, tr)
+
+    def set_custom_cover(self, track, image, scope):
+        """image=None — убрать свою. scope: 'track' / 'album'."""
+        cc = self.cfg.setdefault("custom_covers", {})
+        t, a = cover_keys(track)
+        if image is None:
+            cc.pop(t, None)
+            if a:
+                cc.pop(a, None)
+        else:
+            if scope == "album" and a:
+                cc[a] = image
+                cc.pop(t, None)
+            else:
+                cc[t] = image
+        self.cfg["cover_rev"] = self.cfg.get("cover_rev", 0) + 1      # статус обновится сразу
+        save_cfg(self.cfg)
+
     def help_image(self):
         messagebox.showinfo("Своя картинка",
             "1. Открой discord.com/developers/applications → своё приложение\n"
@@ -2643,6 +2835,12 @@ class App(tk.Tk):
                 if cmd == "quit":
                     self.quit_app()
                     return
+                if cmd == "whats_new":
+                    self.show_whats_new(max(0, self.build - 5), manual=True)
+                    continue
+                if cmd == "news":
+                    self.news_window(msg["notes"], msg["title"])
+                    continue
                 if cmd == "check_update":
                     self.check_update(manual=msg.get("manual", False))
                     continue
@@ -2706,6 +2904,64 @@ class App(tk.Tk):
         if st == "checking":
             return "Проверяю обновления…"
         return f"Проверить обновления (сборка {self.build or '—'})"
+
+    def check_whats_new(self):
+        if not updater.can_update():
+            return
+        last = int(self.cfg.get("last_seen_build") or 0)
+        self.cfg["last_seen_build"] = self.build
+        save_cfg(self.cfg)
+        if 0 < last < self.build:
+            self.show_whats_new(last)
+
+    def show_whats_new(self, after, manual=False):
+        q = self.q
+
+        def work():
+            try:
+                notes = updater.notes_since(UPDATE_REPO, after, self.build)
+            except Exception as e:
+                if manual:
+                    q.put({"cmd": "update_msg", "text": f"Не удалось загрузить список изменений: {e}"})
+                return
+            if notes:
+                q.put({"cmd": "news", "notes": notes,
+                       "title": "Что нового" if manual else f"Обновлено до сборки {self.build}"})
+            elif manual:
+                q.put({"cmd": "update_msg", "text": "Список изменений пуст."})
+        threading.Thread(target=work, daemon=True).start()
+
+    def news_window(self, notes, title):
+        w = tk.Toplevel(self)
+        w.title(title)
+        w.configure(bg=C["bg"])
+        w.attributes("-topmost", True)
+        try:
+            w.iconbitmap(resource("icon.ico"))
+        except Exception:
+            pass
+        box = tk.Frame(w, bg=C["panel"], padx=16, pady=12, highlightthickness=1,
+                       highlightbackground=C["line"])
+        box.pack(fill="both", expand=True, padx=12, pady=12)
+        tk.Label(box, text=title.upper(), bg=C["panel"], fg=C["gold"], font=(SERIF, 13, "bold"),
+                 anchor="w").pack(fill="x")
+        txt = tk.Text(box, bg=C["panel"], fg=C["cream"], relief="flat", wrap="word", width=54, height=14,
+                      font=(SANS, 10), highlightthickness=0)
+        txt.tag_configure("h", foreground=C["glow"], font=(SANS, 10, "bold"), spacing1=8)
+        for build, text in notes:
+            txt.insert("end", f"Сборка {build}\n", "h")
+            for ln in text.splitlines():
+                if ln.strip():
+                    txt.insert("end", ("  " + ln if ln.startswith("•") else "  • " + ln) + "\n")
+        txt.config(state="disabled")
+        txt.pack(fill="both", expand=True, pady=(6, 8))
+        row = tk.Frame(box, bg=C["panel"])
+        row.pack(fill="x")
+        PButton(row, "Все сборки на GitHub", lambda: webbrowser.open(
+            f"https://github.com/{UPDATE_REPO}/releases")).pack(side="left")
+        PButton(row, "Понятно", w.destroy, accent=True).pack(side="right")
+        if self.state() in ("withdrawn", "iconic"):
+            w.lift()
 
     def update_tick(self):
         if updater.can_update() and self.cfg.get("auto_update", True) \
