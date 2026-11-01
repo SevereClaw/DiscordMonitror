@@ -144,7 +144,9 @@ def _run_script(params, app):
     with open(path, "w", encoding="ascii", newline="\r\n") as f:
         f.write(_SCRIPT)
     cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", path]
-    base = 0x00000008 | 0x00000200 | 0x08000000          # DETACHED | NEW_GROUP | NO_WINDOW
+    # Без DETACHED_PROCESS: с ним PowerShell не стартует. Скрипт и так переживает
+    # выход программы — на Windows дочерний процесс не умирает вместе с родителем.
+    base = 0x00000200 | 0x08000000                       # NEW_PROCESS_GROUP | NO_WINDOW
     for flags in (base | 0x01000000, base):              # + BREAKAWAY_FROM_JOB, если можно
         try:
             subprocess.Popen(cmd, env=_clean_env(), creationflags=flags, close_fds=True,
