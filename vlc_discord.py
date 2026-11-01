@@ -470,18 +470,35 @@ def is_blacklisted(track, patterns):
 _cover_cache = {}
 
 
-def find_cover(artist, title):
-    key = (artist.lower(), title.lower())
+def _norm(s):
+    s = re.sub(r"[\(\[].*?[\)\]]", " ", (s or "").casefold())
+    return re.sub(r"[^\w]+", " ", s).strip()
+
+
+def find_cover(artist, title, album=""):
+    """Обложка из iTunes. Если известен альбом — берём трек именно из этого альбома."""
+    key = (artist.lower(), title.lower(), album.lower())
     if key in _cover_cache:
         return _cover_cache[key]
     url = None
     try:
         q = urllib.parse.quote(f"{artist} {title}".strip())
         with urllib.request.urlopen(
-                f"https://itunes.apple.com/search?term={q}&entity=song&limit=1", timeout=4) as r:
-            res = json.loads(r.read().decode()).get("results") or []
-        if res and res[0].get("artworkUrl100"):
-            url = res[0]["artworkUrl100"].replace("100x100", "512x512")
+                f"https://itunes.apple.com/search?term={q}&entity=song&limit=15", timeout=5) as r:
+            res = [x for x in (json.loads(r.read().decode()).get("results") or [])
+                   if x.get("artworkUrl100")]
+        alb, tit = _norm(album), _norm(title)
+        best = None
+        if alb:                                   # тот же альбом
+            best = next((x for x in res if alb and (alb in _norm(x.get("collectionName"))
+                                                    or _norm(x.get("collectionName")) in alb)), None)
+        if not best and tit:                      # то же название песни
+            best = next((x for x in res if tit and (tit in _norm(x.get("trackName"))
+                                                    or _norm(x.get("trackName")) in tit)), None)
+        if not best and not alb and res:
+            best = res[0]
+        if best:
+            url = best["artworkUrl100"].replace("100x100bb", "512x512bb").replace("100x100", "512x512")
     except Exception:
         pass
     _cover_cache[key] = url
@@ -619,6 +636,7 @@ FILE_COVERS = FileCovers()
 
 
 # ───────────────────────── Discord IPC ─────────────────────────
+COVER_SRC = {"last": ""}   # откуда взята обложка в последнем статусе (для строки состояния)
 MP_CACHE = {}        # (client_id, ссылка) -> «mp:external/…», который вернул Discord
 BAD_IMAGES = {}      # ссылка -> когда Discord её не принял (10 минут пробуем другую)
 
@@ -678,9 +696,6 @@ class DiscordIPC:
                 v = activity["assets"].get(k)
                 if isinstance(v, str) and v.startswith("http"):
                     sent[k] = v
-                    mp = MP_CACHE.get((self.client_id, v))
-                    if mp:
-                        activity["assets"][k] = mp
         self._send(1, {"cmd": "SET_ACTIVITY", "nonce": str(uuid.uuid4()),
                        "args": {"pid": self.pid, "activity": activity}})
         while True:                                  # пропустить посторонние события
@@ -839,15 +854,30 @@ def build_activity(track, cfg, lyric=None):
         "assets": {"large_text": fit(large_text)},
         "instance": False,
     }
-    if cfg.get("file_covers", True) and track.get("cover_file"):
-        cover = FILE_COVERS.url_for(track["cover_file"], track.get("cover_hash"))
-        if cover and image_ok(cover):
+    # Сначала iTunes: эти ссылки Discord показывает надёжно. Картинки с временного
+    # хостинга у части людей Discord не открывает («?»), поэтому обложка из файла —
+    # когда в iTunes такого трека нет (или выбрано «сначала из файла»).
+    file_first = cfg.get("cover_order", "itunes") == "file"
+    want_web = (cfg.get("covers") or track.get("cover_file")) and (track["artist"] or track["title"])
+
+    def web():
+        c = find_cover(track["artist"], track["title"], track.get("album") or "") if want_web else None
+        return c if c and image_ok(c) else None
+
+    def from_file():
+        if not (cfg.get("file_covers", True) and track.get("cover_file")):
+            return None
+        c = FILE_COVERS.url_for(track["cover_file"], track.get("cover_hash"))
+        return c if c and image_ok(c) else None
+
+    for get in ((from_file, web) if file_first else (web, from_file)):
+        cover = get()
+        if cover:
             act["assets"]["large_image"] = cover
-    if ((cfg.get("covers") or track.get("cover_file")) and "large_image" not in act["assets"]
-            and (track["artist"] or track["title"])):
-        cover = find_cover(track["artist"], track["title"])   # запасной вариант — iTunes
-        if cover and image_ok(cover):
-            act["assets"]["large_image"] = cover
+            COVER_SRC["last"] = "из файла" if get is from_file else "iTunes"
+            break
+    else:
+        COVER_SRC["last"] = ""
     fallback = (cfg.get("fallback_image") or "").strip()
     if fallback and "large_image" not in act["assets"]:
         act["assets"]["large_image"] = fallback
@@ -1372,10 +1402,13 @@ class Worker(threading.Thread):
             note += f"\n♪ {self.last_lyric}"
         if is_video(track) and not track.get("cover_file"):
             note += " · превью: " + (THUMB_STATUS["error"][:50] or "нет")
-        if track.get("cover_file") and self.cfg.get("file_covers", True):
-            note += " · " + ("превью" if is_video(track) else "обложка из файла") + ((" ✓" if image_ok(file_cover) else " ✗ Discord не принял — беру из iTunes") if file_cover else
-                                             (" — загружаю…" if not FILE_COVERS.last_error
-                                              else f" — не вышло ({FILE_COVERS.last_error[:40]})"))
+        if COVER_SRC["last"] == "iTunes" and not is_video(track):
+            note += " · обложка: iTunes ✓"
+        elif track.get("cover_file") and self.cfg.get("file_covers", True):
+            note += " · " + ("превью" if is_video(track) else "обложка из файла") + (
+                (" ✓" if image_ok(file_cover) else " ✗ Discord не принял") if file_cover else
+                (" — загружаю…" if not FILE_COVERS.last_error
+                 else f" — не вышло ({FILE_COVERS.last_error[:40]})"))
         note += self.v_note
         self.status("live" if track["playing"] else "paused",
                     ("В эфире" if track["playing"] else "На паузе") + f" · {track['app']}" + note,
@@ -1887,9 +1920,11 @@ class App(tk.Tk):
         self.tg_fcover = PToggle(box, "Обложка из самого файла (MP3 Плеер, VLC)",
                                  self.cfg.get("file_covers", True), self.save_opts)
         self.tg_cover = PToggle(box, "Искать обложки альбомов в интернете", self.cfg["covers"], self.save_opts)
+        self.tg_ffirst = PToggle(box, "Сначала обложка из файла, iTunes — запасной",
+                                 self.cfg.get("cover_order", "itunes") == "file", self.save_opts)
         self.tg_pause = PToggle(box, "Показывать, когда на паузе", self.cfg["show_paused"], self.save_opts)
         self.tg_auto = PToggle(box, "Запускать вместе с Windows", self.cfg["autostart"], self.save_opts)
-        for t in (self.tg_fcover, self.tg_cover, self.tg_pause, self.tg_auto):
+        for t in (self.tg_fcover, self.tg_cover, self.tg_ffirst, self.tg_pause, self.tg_auto):
             t.pack(fill="x", pady=2)
 
         drow = tk.Frame(box, bg=C["panel"])
@@ -2409,6 +2444,7 @@ class App(tk.Tk):
     def save_opts(self):
         self.cfg["covers"] = self.tg_cover.value
         self.cfg["file_covers"] = self.tg_fcover.value
+        self.cfg["cover_order"] = "file" if self.tg_ffirst.value else "itunes"
         self.cfg["show_paused"] = self.tg_pause.value
         if self.tg_auto.value != self.cfg["autostart"]:
             try:
