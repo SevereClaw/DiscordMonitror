@@ -15,7 +15,7 @@ python -m pip install --quiet --upgrade pip pyinstaller -r requirements.txt
 if errorlevel 1 goto fail
 
 echo [2/3] Building exe...
-python -m PyInstaller --noconfirm --clean --onefile --noconsole --name "Music-Discord" --icon icon.ico --add-data "icon.ico;." --collect-all winrt --hidden-import winrt.windows.media.control --hidden-import pystray._win32 --hidden-import winrt.windows.foundation --hidden-import winrt.windows.foundation.collections --hidden-import winrt.windows.storage.streams --hidden-import winrt.windows.security.cryptography --log-level WARN vlc_discord.py
+python -m PyInstaller --noconfirm --clean --onefile --noconsole --name "Music-Discord" --icon icon.ico --add-data "icon.ico;." --collect-all winrt --hidden-import winrt.windows.media.control --hidden-import pystray._win32 --hidden-import winrt.windows.foundation --hidden-import winrt.windows.foundation.collections --hidden-import winrt.windows.storage.streams --hidden-import winrt.windows.security.cryptography --hidden-import lz4.block --log-level WARN vlc_discord.py
 if errorlevel 1 goto fail
 
 echo [3/3] Cleaning up...

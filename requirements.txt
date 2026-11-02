@@ -6,3 +6,4 @@ pystray
 pillow
 winrt-Windows.Storage.Streams
 winrt-Windows.Security.Cryptography
+lz4

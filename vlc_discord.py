@@ -899,10 +899,14 @@ def build_activity(track, cfg, lyric=None):
         c = FILE_COVERS.url_for(track["cover_file"], track.get("cover_hash"))
         return c if c and image_ok(c) else None
 
+    vinfo = VIDEO_LINKS.get(track) if is_video(track) else None
+    add_video_link(act, vinfo)
     mine, scope = custom_cover(cfg, track)
+    if not mine and vinfo and vinfo.get("thumb"):  # ролик в браузере — превью с YouTube
+        mine, scope = vinfo["thumb"], "превью YouTube"
     if mine:                                       # своя картинка — всегда главнее
         act["assets"]["large_image"] = mine
-        COVER_SRC["last"] = f"своя ({scope})"
+        COVER_SRC["last"] = scope if scope == "превью YouTube" else f"своя ({scope})"
     for get in (() if mine else (from_file, web) if file_first else (web, from_file)):
         cover = get()
         if cover:
@@ -958,6 +962,211 @@ def is_video(track):
     return track.get("app") in BROWSERS
 
 
+# ───────────────────────── ссылка на видео и превью YouTube ─────────────────────────
+# Браузер сообщает Windows только название и канал. Ссылку берём из открытых вкладок
+# Firefox (файл сессии), а если не вышло — ищем на YouTube по названию. Превью —
+# прямо с серверов YouTube (i.ytimg.com): ничего никуда загружать не нужно.
+_YT_ID = re.compile(r"(?:[?&]v=|youtu\.be/|/shorts/|/live/|/embed/)([\w-]{11})")
+
+
+def _norm_t(s):
+    s = re.sub(r"^\(\d+\)\s*", "", (s or "")).casefold()
+    s = re.sub(r"\s*[-–—]\s*youtube( music)?\s*$", "", s)
+    return re.sub(r"[^\w]+", " ", s).strip()
+
+
+def mozlz4_decode(data):
+    """Файлы сессии Firefox (*.jsonlz4): «mozLz40\\0» + размер + блок LZ4."""
+    if data[:8] != b"mozLz40\0":
+        raise ValueError("не mozlz4")
+    size = struct.unpack("<I", data[8:12])[0]
+    src = data[12:]
+    try:
+        import lz4.block
+        return lz4.block.decompress(src, uncompressed_size=size)
+    except ImportError:
+        pass
+    out = bytearray()
+    i, n = 0, len(src)
+    while i < n:
+        tok = src[i]
+        i += 1
+        lit = tok >> 4
+        if lit == 15:
+            while True:
+                b = src[i]
+                i += 1
+                lit += b
+                if b != 255:
+                    break
+        out += src[i:i + lit]
+        i += lit
+        if i >= n:
+            break
+        off = src[i] | (src[i + 1] << 8)
+        i += 2
+        ml = tok & 15
+        if ml == 15:
+            while True:
+                b = src[i]
+                i += 1
+                ml += b
+                if b != 255:
+                    break
+        ml += 4
+        start = len(out) - off
+        if off >= ml:
+            out += out[start:start + ml]
+        else:
+            for k in range(ml):
+                out.append(out[start + k])
+    return bytes(out)
+
+
+_FF_CACHE = {"path": None, "mtime": 0, "tabs": []}
+
+
+def firefox_tabs():
+    """[(заголовок, адрес)] открытых вкладок Firefox (все профили; самый свежий файл)."""
+    base = os.path.join(os.environ.get("APPDATA", ""), "Mozilla", "Firefox", "Profiles")
+    best = None
+    try:
+        for prof in os.listdir(base):
+            for name in ("recovery.jsonlz4", "previous.jsonlz4"):
+                p = os.path.join(base, prof, "sessionstore-backups", name)
+                if os.path.isfile(p):
+                    m = os.path.getmtime(p)
+                    if not best or m > best[1]:
+                        best = (p, m)
+                    break
+    except OSError:
+        return []
+    if not best:
+        return []
+    if _FF_CACHE["path"] == best[0] and _FF_CACHE["mtime"] == best[1]:
+        return _FF_CACHE["tabs"]
+    with open(best[0], "rb") as f:
+        js = json.loads(mozlz4_decode(f.read()).decode("utf-8", "replace"))
+    tabs = []
+    for w in js.get("windows") or []:
+        for t in w.get("tabs") or []:
+            ent = t.get("entries") or []
+            idx = int(t.get("index") or len(ent)) - 1
+            if 0 <= idx < len(ent):
+                tabs.append((ent[idx].get("title") or "", ent[idx].get("url") or ""))
+    _FF_CACHE.update(path=best[0], mtime=best[1], tabs=tabs)
+    return tabs
+
+
+def youtube_search(title, channel=""):
+    """ID первого подходящего видео в поиске YouTube или None."""
+    q = urllib.parse.quote(f"{title} {channel}".strip())
+    req = urllib.request.Request(f"https://www.youtube.com/results?search_query={q}&hl=ru",
+                                 headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36",
+                                          "Accept-Language": "ru,en;q=0.8"})
+    with urllib.request.urlopen(req, timeout=8) as r:
+        html = r.read().decode("utf-8", "replace")
+    want = _norm_t(title)
+    first = None
+    for m in re.finditer(r'"videoRenderer":\{"videoId":"([\w-]{11})".{0,1500}?"title":\{"runs":\[\{"text":"(.*?)"\}',
+                         html):
+        vid = m.group(1)
+        try:
+            t = json.loads('"' + m.group(2) + '"')
+        except Exception:
+            t = m.group(2)
+        first = first or vid
+        nt = _norm_t(t)
+        if want and (want in nt or nt in want):
+            return vid
+    return first
+
+
+def best_thumb(vid):
+    """Самое чёткое превью без чёрных полос, какое есть у ролика."""
+    for name in ("maxresdefault.jpg", "hq720.jpg"):
+        url = f"https://i.ytimg.com/vi/{vid}/{name}"
+        try:
+            req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": DISCORD_UA})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                if r.status == 200:
+                    return url
+        except Exception:
+            continue
+    return f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"
+
+
+class VideoLinks:
+    """Ссылка и превью для ролика в браузере; ищет в фоне, отдаёт из кэша."""
+    def __init__(self):
+        self.cache = {}          # (заголовок, канал) -> {"url", "thumb", "src"} или {} (не нашли)
+        self.busy = set()
+        self.lock = threading.Lock()
+        self.status = ""
+
+    def get(self, track):
+        key = (track.get("title") or "", track.get("artist") or "")
+        if not key[0]:
+            return None
+        with self.lock:
+            hit = self.cache.get(key)
+            if hit is not None:
+                if hit.get("url"):
+                    return hit
+                if time.time() - hit.get("_t", 0) < 120:      # не нашли — повторим через 2 минуты
+                    return None
+            if key in self.busy:
+                return None
+            self.busy.add(key)
+        threading.Thread(target=self._find, args=(key, track.get("app") or ""), daemon=True).start()
+        return None
+
+    def _find(self, key, app):
+        title, channel = key
+        info, err = {}, ""
+        try:
+            if app == "Firefox":
+                want = _norm_t(title)
+                for t, url in firefox_tabs():
+                    nt = _norm_t(t)
+                    if url.startswith("http") and want and (want in nt or nt == want):
+                        info = {"url": url, "src": "вкладка Firefox"}
+                        break
+        except Exception as e:
+            err = f"Firefox: {type(e).__name__}"
+        vid = None
+        if info.get("url"):
+            m = _YT_ID.search(info["url"])
+            vid = m.group(1) if m else None
+        if not info:
+            try:
+                vid = youtube_search(title, channel)
+                if vid:
+                    info = {"url": f"https://www.youtube.com/watch?v={vid}", "src": "поиск YouTube"}
+            except Exception as e:
+                err = (err + "; " if err else "") + f"поиск YouTube: {type(e).__name__}"
+        if vid:
+            info["thumb"] = best_thumb(vid)
+        self.status = err
+        with self.lock:
+            self.cache[key] = info if info else {"_t": time.time()}
+            self.busy.discard(key)
+            if len(self.cache) > 300:
+                self.cache.clear()
+
+
+VIDEO_LINKS = VideoLinks()
+
+
+def add_video_link(act, info):
+    """Название и картинка карточки — ссылка на видео (кликается в профиле Discord)."""
+    if not info or not info.get("url"):
+        return
+    act["details_url"] = info["url"][:256]
+    act.setdefault("assets", {})["large_url"] = info["url"][:256]
+
+
 def build_video_activity(track, cfg, thumb=None):
     title, channel = track["title"], track["artist"]
     act = {
@@ -968,17 +1177,19 @@ def build_video_activity(track, cfg, thumb=None):
         "assets": {"large_text": fit(track.get("app") or "YouTube")},
         "instance": False,
     }
-    img = thumb or (cfg.get("video_image") or "").strip()
+    info = VIDEO_LINKS.get(track)
+    img = (info or {}).get("thumb") or thumb or (cfg.get("video_image") or "").strip()
     if img:
         act["assets"]["large_image"] = img
+    add_video_link(act, info)
     if not track["playing"]:
         act["state"] = fit("⏸ На паузе · " + (channel or track.get("app") or ""))
     elif track["length"] > 0:
         start = int(time.time()) - track["time"]
         act["timestamps"] = {"start": start * 1000, "end": (start + track["length"]) * 1000}
     q = urllib.parse.quote(f"{channel} {title}".strip())
-    act["buttons"] = [{"label": "▶ Найти на YouTube",
-                       "url": f"https://www.youtube.com/results?search_query={q}"[:512]}]
+    link = (info or {}).get("url") or f"https://www.youtube.com/results?search_query={q}"
+    act["buttons"] = [{"label": "▶ Смотреть" if info else "▶ Найти на YouTube", "url": link[:512]}]
     return act
 
 
@@ -1421,7 +1632,8 @@ class Worker(threading.Thread):
         if self.cfg.get("file_covers", True) and track.get("cover_file"):
             file_cover = FILE_COVERS.url_for(track["cover_file"], track.get("cover_hash"))
         key = (track["src"], track["title"], track["artist"], track["playing"], file_cover,
-               bool(file_cover) and image_ok(file_cover), self.cfg.get("cover_rev", 0))
+               bool(file_cover) and image_ok(file_cover), self.cfg.get("cover_rev", 0),
+               bool(VIDEO_LINKS.get(track)) if is_video(track) else None)
         start = int(time.time()) - track["time"]
         seeked = (track["length"] > 0 and self.last_start is not None
                   and abs(start - self.last_start) > 3)
@@ -1434,13 +1646,16 @@ class Worker(threading.Thread):
         note = " · без веб-интерфейса VLC" if track.get("via") == "title" else ""
         if self.last_lyric:
             note += f"\n♪ {self.last_lyric}"
-        if is_video(track) and not track.get("cover_file"):
-            note += " · превью: " + (THUMB_STATUS["error"][:50] or "нет")
+        if is_video(track):
+            vi = VIDEO_LINKS.get(track)
+            note += (f" · превью и ссылка ✓ ({vi.get('src')})" if vi else
+                     " · ищу ссылку на видео…" if (track["title"], track["artist"]) in VIDEO_LINKS.busy else
+                     " · ссылку не нашёл" + (f" ({VIDEO_LINKS.status[:40]})" if VIDEO_LINKS.status else ""))
         if COVER_SRC["last"].startswith("своя") and not is_video(track):
             note += f" · обложка: {COVER_SRC['last']} ✓"
         elif COVER_SRC["last"] == "iTunes" and not is_video(track):
             note += " · обложка: iTunes ✓"
-        elif track.get("cover_file") and self.cfg.get("file_covers", True):
+        elif track.get("cover_file") and self.cfg.get("file_covers", True) and not is_video(track):
             note += " · " + ("превью" if is_video(track) else "обложка из файла") + (
                 (" ✓" if image_ok(file_cover) else " ✗ Discord не принял") if file_cover else
                 (" — загружаю…" if not FILE_COVERS.last_error
@@ -1471,12 +1686,17 @@ class Worker(threading.Thread):
             if track.get("cover_file"):
                 thumb = FILE_COVERS.url_for(track["cover_file"])
             start = int(time.time()) - track["time"]
-            key = (track["src"], track["title"], track["artist"], track["playing"], thumb)
+            vinfo = VIDEO_LINKS.get(track)
+            key = (track["src"], track["title"], track["artist"], track["playing"], thumb, bool(vinfo))
             seeked = track["length"] > 0 and self.v_start is not None and abs(start - self.v_start) > 3
             if key != self.v_key or seeked:
                 self.vipc.set_activity(build_video_activity(track, self.cfg, thumb))
                 self.v_key, self.v_start, self.v_shown = key, start, True
-            if thumb:
+            if vinfo:
+                pv = f"превью и ссылка ✓ ({vinfo.get('src')})"
+            elif track["title"] in {k[0] for k in VIDEO_LINKS.busy}:
+                pv = "ищу ссылку на видео…"
+            elif thumb:
                 pv = "превью ✓"
             elif track.get("cover_file"):
                 pv = "превью: загружаю…" if not FILE_COVERS.last_error else f"превью: {FILE_COVERS.last_error[:40]}"

@@ -39,6 +39,11 @@ jobs:
           python tests/test_updater.py start
           python tests/test_updater.py check
 
+      - name: Video links (Firefox tabs + YouTube)
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python tests/test_video_links.py
+
       - name: Stamp build number (for auto-update)
         shell: pwsh
         run: Set-Content -Path build_info.py -Value "BUILD = ${{ github.run_number }}" -Encoding ascii
@@ -54,7 +59,7 @@ jobs:
           --hidden-import winrt.windows.foundation.collections
           --hidden-import winrt.windows.storage.streams
           --hidden-import winrt.windows.security.cryptography
-          --hidden-import updater --hidden-import build_info
+          --hidden-import updater --hidden-import build_info --hidden-import lz4.block
           --log-level WARN
           vlc_discord.py
 
