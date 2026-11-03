@@ -38,5 +38,19 @@ act = vd.build_activity(dict(artist="Rosa Walton", title="I Really Want to Stay 
                              playing=True, length=246, time=10, app="MP3 Плеер", src="t"),
                         {"covers": False, "lyrics": "off", "ytmusic": True, "file_covers": False})
 print("карточка:", act.get("details_url"), act.get("assets"))
+bad_icons = 0
+for name, url in (("YouTube", vd.favicon_url("youtube.com")), ("Twitch", vd.favicon_url("twitch.tv")),
+                  ("Spotify", vd.favicon_url("open.spotify.com")), ("MP3 Плеер", vd.MP3P_ICON)):
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": vd.DISCORD_UA})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            ok = vd._looks_like_image(r.read(16))
+    except Exception as e:
+        ok = False
+        print("  ", e)
+    print(f"значок {name}: {'картинка ✓' if ok else 'НЕ ОТКРЫВАЕТСЯ'}")
+    bad_icons += not ok
 print(f"найдено {found} из {len(CASES)}")
+if bad_icons:
+    sys.exit(1)
 sys.exit(0 if found >= 3 and act.get("details_url") else 1)

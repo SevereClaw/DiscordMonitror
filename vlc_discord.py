@@ -862,11 +862,41 @@ APP_ICON_KEYS = {
 BROWSERS = {"Chrome", "Edge", "Firefox", "Opera", "Яндекс Браузер"}
 
 
-def app_icon_key(track, cfg):
+# Значки по ссылке — работают сразу, ничего не надо загружать в Discord.
+APP_DOMAINS = {
+    "Spotify": "open.spotify.com", "Яндекс Музыка": "music.yandex.ru", "AIMP": "aimp.ru",
+    "foobar2000": "foobar2000.org", "VLC": "videolan.org", "Telegram": "telegram.org",
+    "iTunes": "music.apple.com", "Deezer": "deezer.com", "VK": "vk.com",
+    "SoundCloud": "soundcloud.com", "Медиаплеер": "microsoft.com",
+}
+MP3P_ICON = "https://raw.githubusercontent.com/SevereClaw/MP3-Player/main/assets/icon.png"
+SITE_ALIASES = {"youtube": "youtube.com", "ютуб": "youtube.com", "twitch": "twitch.tv",
+                "vk": "vk.com", "rutube": "rutube.ru", "yandex": "music.yandex.ru",
+                "soundcloud": "soundcloud.com", "spotify": "open.spotify.com"}
+
+
+def favicon_url(domain):
+    """Значок сайта (128×128) с серверов Google — прямая ссылка на PNG."""
+    return ("https://t1.gstatic.com/faviconV2?client=SOCIAL&type=FAVICON&fallback_opts=TYPE,SIZE,URL"
+            f"&url=https://{domain}&size=128")
+
+
+def app_icon_key(track, cfg, link=None):
+    """Картинка для значка в углу: ссылка (по приложению или сайту ролика) или имя из Art Assets."""
     app = track.get("app") or "VLC"
+    if app == MP3P_APP:
+        return MP3P_ICON
     if app in BROWSERS:
-        return (cfg.get("browser_icon") or "").strip().lower() or None
-    return APP_ICON_KEYS.get(app)
+        host = (urllib.parse.urlsplit(link or "").hostname or "").lower()
+        if host:
+            return favicon_url(host.removeprefix("www.").removeprefix("m."))
+        v = (cfg.get("browser_icon") or "youtube").strip().lower()
+        if v.startswith("http"):
+            return v
+        return favicon_url(SITE_ALIASES.get(v, v if "." in v else "youtube.com"))
+    if app in APP_DOMAINS:
+        return favicon_url(APP_DOMAINS[app])
+    return None
 
 
 def build_activity(track, cfg, lyric=None):
@@ -937,10 +967,12 @@ def build_activity(track, cfg, lyric=None):
     if badge == "logo":
         small = fallback
     elif badge == "app":
-        small = app_icon_key(track, cfg) or fallback
+        link = (vinfo or {}).get("url") if is_video(track) else None
+        small = app_icon_key(track, cfg, link) or fallback
     if small and act["assets"].get("large_image") and small != act["assets"]["large_image"]:
         act["assets"]["small_image"] = small
-        act["assets"]["small_text"] = fit(track.get("app") or "VLC")
+        act["assets"]["small_text"] = fit((site_name((vinfo or {}).get("url")) if is_video(track) and vinfo
+                                          else track.get("app")) or "VLC")
 
     if not track["playing"]:
         act["state"] = fit("⏸ На паузе · " + state)
@@ -1387,6 +1419,9 @@ def build_video_activity(track, cfg, thumb=None):
         act["assets"]["large_image"] = img
     add_video_link(act, info)
     as_watching(act, info)
+    if cfg.get("badge", "none") == "app" and act["assets"].get("large_image"):
+        act["assets"]["small_image"] = app_icon_key(track, cfg, (info or {}).get("url"))
+        act["assets"]["small_text"] = fit(act["name"] if act.get("name") != "видео" else track.get("app") or "")
     if not track["playing"]:
         act["state"] = fit("⏸ На паузе · " + (channel or track.get("app") or ""))
     elif track["length"] > 0:
@@ -2634,7 +2669,7 @@ class App(tk.Tk):
             self.badge_toggles[key] = t
         row = tk.Frame(box, bg=C["panel"])
         row.pack(fill="x", pady=(6, 0))
-        tk.Label(row, text="Музыка из браузера — значок", bg=C["panel"], fg=C["cream"],
+        tk.Label(row, text="Сайт, если ссылка не нашлась", bg=C["panel"], fg=C["cream"],
                  font=(SANS, 9)).pack(side="left")
         self.browser_var = tk.StringVar(value=self.cfg.get("browser_icon", "youtube"))
         self.entry(row, self.browser_var, 12).pack(side="left", padx=8, ipady=2)
@@ -3239,13 +3274,14 @@ class App(tk.Tk):
         self.render_preview()
 
     def help_icons(self):
-        names = ", ".join(sorted(set(APP_ICON_KEYS.values())))
         messagebox.showinfo("Значки приложений",
-            "Загрузи в Discord (Rich Presence → Art Assets) картинки с такими именами:\n\n"
-            f"{names}\n\n"
-            "Нужны только те, чем пользуешься. Для музыки из браузера берётся имя, "
-            "вписанное ниже (по умолчанию youtube).\n"
-            "Если значка для приложения нет в списке — ставится твой логотип.")
+            "Значок ставится сам, загружать ничего не нужно:\n\n"
+            "• видео в браузере — значок сайта (YouTube, Twitch, VK…), по ссылке на ролик;\n"
+            "• музыка — значок плеера: Spotify, Яндекс Музыка, VLC, AIMP, foobar2000, "
+            "Apple Music, Deezer, VK, SoundCloud, MP3 Плеер.\n\n"
+            "«Сайт, если ссылка не нашлась» — какой значок ставить для браузера, когда "
+            "программа не знает, что за сайт (например youtube или twitch).\n"
+            "Если значка для приложения нет — ставится твой логотип.")
 
     def open_cover_dialog(self):
         tr = self.current
