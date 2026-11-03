@@ -15,6 +15,10 @@ def shot():
     ImageGrab.grab((x, y, x + w, y + h)).save(sys.argv[1].replace(".png", "-2.png"))
     app.toggle_custom(); app.update(); time.sleep(0.3)
     ImageGrab.grab((x, y, x + w, y + h)).save(sys.argv[1].replace(".png", "-3.png"))
+    import base64
+    for suf in ("", "-2", "-3"):
+        f = sys.argv[1].replace(".png", suf + ".png")
+        print("SHOT", os.path.basename(f), base64.b64encode(open(f, "rb").read()).decode())
     app.quit_app()
 app.after(2500, shot)
 app.mainloop()

@@ -733,6 +733,11 @@ class DiscordIPC:
                 break
         if data.get("evt") == "ERROR":
             raise RuntimeError(data.get("data", {}).get("message", "ошибка"))
+        sent_btns = len((activity or {}).get("buttons") or [])
+        echoed = (data.get("data") or {}).get("buttons")
+        # Discord возвращает подписи принятых кнопок; свои кнопки он тебе не показывает
+        self.buttons_state = ("" if not sent_btns else
+                              "ok" if echoed else "unknown" if echoed is None else "rejected")
         got = ((data.get("data") or {}).get("assets") or {})
         for k, url in sent.items():
             if (self.client_id, url) in MP_CACHE:
@@ -1868,6 +1873,11 @@ class Worker(threading.Thread):
                 (" ✓" if image_ok(file_cover) else " ✗ Discord не принял") if file_cover else
                 (" — загружаю…" if not FILE_COVERS.last_error
                  else f" — не вышло ({FILE_COVERS.last_error[:40]})"))
+        bs = getattr(self.ipc, "buttons_state", "") if self.ipc else ""
+        if bs == "ok":
+            note += " · кнопки ✓ (видят друзья, не ты)"
+        elif bs == "rejected":
+            note += " · кнопки Discord не принял"
         note += self.v_note
         self.status("live" if track["playing"] else "paused",
                     ("В эфире" if track["playing"] else "На паузе") + f" · {track['app']}" + note,
