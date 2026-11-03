@@ -976,9 +976,7 @@ def build_activity(track, cfg, lyric=None):
 
     if not track["playing"]:
         act["state"] = fit("⏸ На паузе · " + state)
-    if track["length"] > 0:
-        # и на паузе — полоса и «сколько осталось», а не зелёный счётчик
-        # (Discord сам двигает полосу, поэтому на паузе статус обновляется каждые 5 с)
+    elif track["length"] > 0:
         start = int(time.time()) - track["time"]
         act["timestamps"] = {"start": start * 1000, "end": (start + track["length"]) * 1000}
 
@@ -1426,7 +1424,7 @@ def build_video_activity(track, cfg, thumb=None):
         act["assets"]["small_text"] = fit(act["name"] if act.get("name") != "видео" else track.get("app") or "")
     if not track["playing"]:
         act["state"] = fit("⏸ На паузе · " + (channel or track.get("app") or ""))
-    if track["length"] > 0:
+    elif track["length"] > 0:
         start = int(time.time()) - track["time"]
         act["timestamps"] = {"start": start * 1000, "end": (start + track["length"]) * 1000}
     q = urllib.parse.quote(f"{channel} {title}".strip())
@@ -1878,13 +1876,10 @@ class Worker(threading.Thread):
                bool(VIDEO_LINKS.get(track)) if is_video(track) else
                bool(YT_MUSIC.get(track)) if self.cfg.get("ytmusic", True) else None)
         start = int(time.time()) - track["time"]
-        seeked = (track["playing"] and track["length"] > 0 and self.last_start is not None
+        seeked = (track["length"] > 0 and self.last_start is not None
                   and abs(start - self.last_start) > 3)
         lyric_due = lyric != self.last_lyric and now - self.last_set >= 4.2   # лимит Discord
-        # на паузе Discord всё равно двигает полосу — раз в 5 с ставим её обратно на место
-        paused_due = (not track["playing"] and track["length"] > 0 and self.last_start is not None
-                      and start != self.last_start and now - self.last_set >= 5)
-        if key != self.last_key or seeked or lyric_due or paused_due:
+        if key != self.last_key or seeked or lyric_due:
             self.ipc.set_activity(build_activity(track, self.cfg, lyric))
             self.shown, self.last_key, self.last_start = True, key, start
             self.last_src = track["src"]
@@ -1946,15 +1941,10 @@ class Worker(threading.Thread):
             start = int(time.time()) - track["time"]
             vinfo = VIDEO_LINKS.get(track)
             key = (track["src"], track["title"], track["artist"], track["playing"], thumb, bool(vinfo))
-            seeked = (track["playing"] and track["length"] > 0 and self.v_start is not None
-                      and abs(start - self.v_start) > 3)
-            v_now = time.monotonic()
-            paused_due = (not track["playing"] and track["length"] > 0 and self.v_start is not None
-                          and start != self.v_start and v_now - getattr(self, "v_last_set", 0) >= 5)
-            if key != self.v_key or seeked or paused_due:
+            seeked = track["length"] > 0 and self.v_start is not None and abs(start - self.v_start) > 3
+            if key != self.v_key or seeked:
                 self.vipc.set_activity(build_video_activity(track, self.cfg, thumb))
                 self.v_key, self.v_start, self.v_shown = key, start, True
-                self.v_last_set = v_now
             if vinfo:
                 pv = f"превью и ссылка ✓ ({vinfo.get('src')})"
             elif track["title"] in {k[0] for k in VIDEO_LINKS.busy}:
