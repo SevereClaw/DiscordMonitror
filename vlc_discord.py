@@ -951,6 +951,8 @@ def build_activity(track, cfg, lyric=None):
             btns.append({"label": label[:32], "url": url.format(q=query)[:512]})
     if btns:
         act["buttons"] = btns
+    if is_video(track):
+        as_watching(act, vinfo)
     if not act["assets"]:
         del act["assets"]
     return act
@@ -1336,6 +1338,26 @@ class YTMusic:
 YT_MUSIC = YTMusic()
 
 
+SITE_NAMES = [("youtube.com", "YouTube"), ("youtu.be", "YouTube"), ("twitch.tv", "Twitch"),
+              ("vkvideo.ru", "VK Видео"), ("vk.com", "VK Видео"), ("rutube.ru", "Rutube"),
+              ("kick.com", "Kick"), ("netflix.com", "Netflix"), ("anilib", "AniLib"),
+              ("animego", "AnimeGO"), ("kinopoisk.ru", "Кинопоиск"), ("ok.ru", "OK Видео"),
+              ("dzen.ru", "Дзен"), ("tiktok.com", "TikTok"), ("bilibili", "Bilibili")]
+
+
+def site_name(url):
+    """«Смотрит YouTube» — название сайта по ссылке, иначе просто «видео»."""
+    host = (urllib.parse.urlsplit(url or "").hostname or "").lower()
+    return next((n for dom, n in SITE_NAMES if dom in host), "видео")
+
+
+def as_watching(act, info):
+    """Карточка ролика из браузера: «Смотрит YouTube» вместо «Слушает <приложение>»."""
+    act["type"] = 3
+    act["name"] = site_name((info or {}).get("url"))
+    act["status_display_type"] = 2          # в списке участников — название ролика
+
+
 def add_video_link(act, info):
     """Название и картинка карточки — ссылка на видео (кликается в профиле Discord)."""
     if not info or not info.get("url"):
@@ -1359,6 +1381,7 @@ def build_video_activity(track, cfg, thumb=None):
     if img:
         act["assets"]["large_image"] = img
     add_video_link(act, info)
+    as_watching(act, info)
     if not track["playing"]:
         act["state"] = fit("⏸ На паузе · " + (channel or track.get("app") or ""))
     elif track["length"] > 0:
