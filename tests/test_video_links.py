@@ -56,6 +56,14 @@ try:
 except Exception as e:
     print("поиск YouTube недоступен с сервера:", e)
 
+try:
+    n = vd.youtube_length("dQw4w9WgXcQ")
+    print("длительность с YouTube:", n, "с (ждём 212–213)")
+    if not 200 <= n <= 220:
+        print("(YouTube не отдал длительность серверу GitHub — у тебя дома это может работать)")
+except Exception as e:
+    print("длительность с YouTube недоступна с сервера:", e)
+
 if fails:
     print("FAIL:", fails)
     sys.exit(1)

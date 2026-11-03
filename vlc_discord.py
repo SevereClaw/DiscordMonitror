@@ -979,6 +979,8 @@ def build_activity(track, cfg, lyric=None):
     elif track["length"] > 0:
         start = int(time.time()) - track["time"]
         act["timestamps"] = {"start": start * 1000, "end": (start + track["length"]) * 1000}
+    elif track.get("elapsed_only"):
+        act["timestamps"] = {"start": (int(time.time()) - track["time"]) * 1000}
 
     query = urllib.parse.quote(f"{track['artist']} {track['title']}".strip())
     btns = []
@@ -1129,6 +1131,18 @@ def youtube_search(title, channel=""):
     return first
 
 
+def youtube_length(vid):
+    """Длительность ролика (с) со страницы YouTube или 0."""
+    req = urllib.request.Request(f"https://www.youtube.com/watch?v={vid}&hl=ru",
+                                 headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36",
+                                          "Accept-Language": "ru,en;q=0.8"})
+    with urllib.request.urlopen(req, timeout=8) as r:
+        html = r.read(2_000_000).decode("utf-8", "replace")
+    m = re.search(r'"lengthSeconds":"(\d+)"', html)
+    return int(m.group(1)) if m else 0
+
+
 def best_thumb(vid):
     """Самое чёткое превью без чёрных полос, какое есть у ролика."""
     for name in ("maxresdefault.jpg", "hq720.jpg"):
@@ -1194,6 +1208,13 @@ class VideoLinks:
                 err = (err + "; " if err else "") + f"поиск YouTube: {type(e).__name__}"
         if vid:
             info["thumb"] = best_thumb(vid)
+            try:
+                info["length"] = youtube_length(vid)     # браузер (Firefox) длительность не сообщает
+            except Exception:
+                info["length"] = 0
+        if info.get("url"):
+            m = re.search(r"[?&#]t=(\d+)", info["url"])  # «&t=244s» — с какого места открыли
+            info["start_at"] = int(m.group(1)) if m else 0
         self.status = err
         with self.lock:
             self.cache[key] = info if info else {"_t": time.time()}
@@ -1203,6 +1224,41 @@ class VideoLinks:
 
 
 VIDEO_LINKS = VideoLinks()
+
+
+class WatchClock:
+    """Сколько смотрим ролик — по своим часам (паузы не считаются). Нужен, когда браузер
+    не сообщает позицию (Firefox): иначе Discord показывает свой счётчик и сбрасывает его."""
+    def __init__(self):
+        self.items = {}
+
+    def pos(self, track, start_at=0):
+        key = (track.get("title") or "", track.get("artist") or "", track.get("src") or "")
+        now = time.monotonic()
+        it = self.items.get(key)
+        if it is None:
+            it = self.items[key] = {"pos": float(start_at), "t": now}
+            if len(self.items) > 50:
+                self.items.pop(next(iter(self.items)))
+        if track.get("playing"):
+            it["pos"] += now - it["t"]
+        it["t"] = now
+        return it["pos"]
+
+
+WATCH = WatchClock()
+
+
+def fill_video_time(track):
+    """Ролик в браузере без времени — подставить длительность с YouTube и свою позицию."""
+    if not is_video(track) or track.get("length", 0) > 0:
+        return track
+    info = VIDEO_LINKS.get(track) or {}
+    pos = WATCH.pos(track, info.get("start_at", 0))
+    length = int(info.get("length") or 0)
+    if length > 0:
+        return dict(track, length=length, time=int(min(pos, length)), time_est=True)
+    return dict(track, time=int(pos), elapsed_only=True)      # хотя бы счётчик без сбросов
 
 
 # ───────────────────────── YouTube Music: обложка и ссылка на трек ─────────────────────────
@@ -1427,6 +1483,8 @@ def build_video_activity(track, cfg, thumb=None):
     elif track["length"] > 0:
         start = int(time.time()) - track["time"]
         act["timestamps"] = {"start": start * 1000, "end": (start + track["length"]) * 1000}
+    elif track.get("elapsed_only"):
+        act["timestamps"] = {"start": (int(time.time()) - track["time"]) * 1000}
     q = urllib.parse.quote(f"{channel} {title}".strip())
     link = (info or {}).get("url") or f"https://www.youtube.com/results?search_query={q}"
     act["buttons"] = [{"label": "▶ Смотреть" if info else "▶ Найти на YouTube", "url": link[:512]}]
@@ -1793,6 +1851,7 @@ class Worker(threading.Thread):
 
     def tick(self):
         cands, http_ok = self.collect()
+        cands = [fill_video_time(c) for c in cands]
         if not self.cfg.get("show_paused"):
             cands = [c for c in cands if c["playing"]]
         self.sessions = [(c["app"], c["artist"], c["title"], c["playing"]) for c in cands]
