@@ -44,6 +44,11 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: python tests/test_video_links.py
 
+      - name: YouTube Music search (real requests)
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python tests/test_ytmusic.py
+
       - name: Stamp build number (for auto-update)
         shell: pwsh
         run: Set-Content -Path build_info.py -Value "BUILD = ${{ github.run_number }}" -Encoding ascii

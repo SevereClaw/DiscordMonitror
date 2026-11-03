@@ -901,17 +901,24 @@ def build_activity(track, cfg, lyric=None):
 
     vinfo = VIDEO_LINKS.get(track) if is_video(track) else None
     add_video_link(act, vinfo)
+    ytm = YT_MUSIC.get(track) if (cfg.get("ytmusic", True) and not is_video(track)) else None
+    if ytm:                                        # название — ссылка на трек в YouTube Music
+        add_video_link(act, ytm)
     mine, scope = custom_cover(cfg, track)
     if not mine and vinfo and vinfo.get("thumb"):  # ролик в браузере — превью с YouTube
         mine, scope = vinfo["thumb"], "превью YouTube"
     if mine:                                       # своя картинка — всегда главнее
         act["assets"]["large_image"] = mine
         COVER_SRC["last"] = scope if scope == "превью YouTube" else f"своя ({scope})"
-    for get in (() if mine else (from_file, web) if file_first else (web, from_file)):
+    def from_ytm():
+        return ytm["thumb"] if ytm and ytm.get("thumb") and image_ok(ytm["thumb"]) else None
+
+    for get in (() if mine else (from_file, web, from_ytm) if file_first else (web, from_ytm, from_file)):
         cover = get()
         if cover:
             act["assets"]["large_image"] = cover
-            COVER_SRC["last"] = "из файла" if get is from_file else "iTunes"
+            COVER_SRC["last"] = ("из файла" if get is from_file else
+                                 "YouTube Music" if get is from_ytm else "iTunes")
             break
     else:
         if not mine:
@@ -1157,6 +1164,151 @@ class VideoLinks:
 
 
 VIDEO_LINKS = VideoLinks()
+
+
+# ───────────────────────── YouTube Music: обложка и ссылка на трек ─────────────────────────
+YTM_URL = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false"
+YTM_SONGS = "EgWKAQIIAWoMEA4QChADEAQQCRAF"          # фильтр «Песни»
+YTM_CTX = {"client": {"clientName": "WEB_REMIX", "clientVersion": "1.20241023.01.00",
+                      "hl": "ru", "gl": "RU"}}
+
+
+def _walk(o, key):
+    """Все словари o[...][key] в дереве JSON."""
+    stack = [o]
+    while stack:
+        x = stack.pop()
+        if isinstance(x, dict):
+            if key in x:
+                yield x[key]
+            stack.extend(x.values())
+        elif isinstance(x, list):
+            stack.extend(x)
+
+
+def _runs(col):
+    try:
+        return [r.get("text", "") for r in col["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"]]
+    except Exception:
+        return []
+
+
+def _dur(text):
+    m = re.fullmatch(r"(?:(\d+):)?(\d+):(\d{2})", (text or "").strip())
+    if not m:
+        return 0
+    return int(m.group(1) or 0) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+
+
+def ytm_parse(js):
+    """Ответ поиска → [{'id','title','artist','album','dur','thumb'}]."""
+    out = []
+    for r in _walk(js, "musicResponsiveListItemRenderer"):
+        cols = r.get("flexColumns") or []
+        title = "".join(_runs(cols[0])) if cols else ""
+        sub = _runs(cols[1]) if len(cols) > 1 else []
+        vid = next((v for v in _walk(r, "videoId") if isinstance(v, str) and len(v) == 11), None)
+        if not vid or not title:
+            continue
+        parts = [x.strip() for x in "".join(sub).split("•")]
+        if parts and parts[0].casefold() in ("песня", "song", "видео", "video", "клип"):
+            parts = parts[1:]
+        thumbs = next(iter(_walk(r, "thumbnails")), None) or []
+        thumb = thumbs[-1]["url"] if thumbs and isinstance(thumbs[-1], dict) else ""
+        thumb = re.sub(r"=w\d+-h\d+[^/]*$", "=w544-h544-l90-rj", thumb)
+        out.append({"id": vid, "title": title, "artist": parts[0] if parts else "",
+                    "album": parts[1] if len(parts) > 2 else "",
+                    "dur": _dur(parts[-1]) if parts else 0, "thumb": thumb})
+    return out
+
+
+def ytm_search(query, songs=True, timeout=8):
+    body = {"context": YTM_CTX, "query": query}
+    if songs:
+        body["params"] = YTM_SONGS
+    req = urllib.request.Request(YTM_URL, data=json.dumps(body).encode("utf-8"), method="POST",
+                                 headers={"Content-Type": "application/json",
+                                          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36",
+                                          "Origin": "https://music.youtube.com",
+                                          "Referer": "https://music.youtube.com/"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return ytm_parse(json.loads(r.read().decode("utf-8")))
+
+
+def ytm_best(items, title, artist, length=0):
+    """Самый похожий трек: название, исполнитель, длительность."""
+    want_t, want_a = _norm_t(title), _norm_t(artist)
+    best, score = None, -1
+    for it in items:
+        nt, na = _norm_t(it["title"]), _norm_t(it["artist"])
+        if not want_t or not (want_t in nt or nt in want_t):
+            continue
+        sc = 2
+        if want_a and (want_a in na or na in want_a):
+            sc += 3
+        if length and it["dur"]:
+            d = abs(it["dur"] - length)
+            if d > 20:
+                continue                      # другая версия
+            sc += 2 if d <= 3 else 1
+        if sc > score:
+            best, score = it, sc
+    return best
+
+
+class YTMusic:
+    """Трек на YouTube Music: обложка (квадратная) и ссылка. Ищет в фоне, отдаёт из кэша."""
+    def __init__(self):
+        self.cache, self.busy = {}, set()
+        self.lock = threading.Lock()
+        self.status = ""
+
+    def get(self, track):
+        title, artist = (track.get("title") or "").strip(), (track.get("artist") or "").strip()
+        if not title:
+            return None
+        key = (artist.casefold(), title.casefold())
+        with self.lock:
+            hit = self.cache.get(key)
+            if hit is not None:
+                if hit.get("id"):
+                    return hit
+                if time.time() - hit.get("_t", 0) < 600:   # не нашли — повторим через 10 минут
+                    return None
+            if key in self.busy:
+                return None
+            self.busy.add(key)
+        threading.Thread(target=self._find, args=(key, title, artist, int(track.get("length") or 0)),
+                         daemon=True).start()
+        return None
+
+    def pending(self, track):
+        return ((track.get("artist") or "").strip().casefold(),
+                (track.get("title") or "").strip().casefold()) in self.busy
+
+    def _find(self, key, title, artist, length):
+        found = None
+        try:
+            q = f"{artist} {title}".strip()
+            found = ytm_best(ytm_search(q), title, artist, length)
+            if not found:                                  # без фильтра «Песни»
+                found = ytm_best(ytm_search(q, songs=False), title, artist, length)
+            self.status = ""
+        except Exception as e:
+            self.status = f"{type(e).__name__}"
+        with self.lock:
+            if found:
+                found["url"] = f"https://music.youtube.com/watch?v={found['id']}"
+                self.cache[key] = found
+            else:
+                self.cache[key] = {"_t": time.time()}
+            self.busy.discard(key)
+            if len(self.cache) > 500:
+                self.cache.clear()
+
+
+YT_MUSIC = YTMusic()
 
 
 def add_video_link(act, info):
@@ -1633,7 +1785,8 @@ class Worker(threading.Thread):
             file_cover = FILE_COVERS.url_for(track["cover_file"], track.get("cover_hash"))
         key = (track["src"], track["title"], track["artist"], track["playing"], file_cover,
                bool(file_cover) and image_ok(file_cover), self.cfg.get("cover_rev", 0),
-               bool(VIDEO_LINKS.get(track)) if is_video(track) else None)
+               bool(VIDEO_LINKS.get(track)) if is_video(track) else
+               bool(YT_MUSIC.get(track)) if self.cfg.get("ytmusic", True) else None)
         start = int(time.time()) - track["time"]
         seeked = (track["length"] > 0 and self.last_start is not None
                   and abs(start - self.last_start) > 3)
@@ -1653,8 +1806,15 @@ class Worker(threading.Thread):
                      " · ссылку не нашёл" + (f" ({VIDEO_LINKS.status[:40]})" if VIDEO_LINKS.status else ""))
         if COVER_SRC["last"].startswith("своя") and not is_video(track):
             note += f" · обложка: {COVER_SRC['last']} ✓"
-        elif COVER_SRC["last"] == "iTunes" and not is_video(track):
-            note += " · обложка: iTunes ✓"
+        elif COVER_SRC["last"] in ("iTunes", "YouTube Music") and not is_video(track):
+            note += f" · обложка: {COVER_SRC['last']} ✓"
+        if not is_video(track) and self.cfg.get("ytmusic", True):
+            if YT_MUSIC.get(track):
+                note += " · ссылка YouTube Music ✓"
+            elif YT_MUSIC.pending(track):
+                note += " · ищу на YouTube Music…"
+            elif YT_MUSIC.status:
+                note += f" · YouTube Music: нет связи ({YT_MUSIC.status})"
         elif track.get("cover_file") and self.cfg.get("file_covers", True) and not is_video(track):
             note += " · " + ("превью" if is_video(track) else "обложка из файла") + (
                 (" ✓" if image_ok(file_cover) else " ✗ Discord не принял") if file_cover else
@@ -2323,11 +2483,13 @@ class App(tk.Tk):
         self.tg_fcover = PToggle(box, "Обложка из самого файла (MP3 Плеер, VLC)",
                                  self.cfg.get("file_covers", True), self.save_opts)
         self.tg_cover = PToggle(box, "Искать обложки альбомов в интернете", self.cfg["covers"], self.save_opts)
+        self.tg_ytm = PToggle(box, "Искать трек на YouTube Music (обложка и ссылка в названии)",
+                              self.cfg.get("ytmusic", True), self.save_opts)
         self.tg_ffirst = PToggle(box, "Сначала обложка из файла, iTunes — запасной",
                                  self.cfg.get("cover_order", "itunes") == "file", self.save_opts)
         self.tg_pause = PToggle(box, "Показывать, когда на паузе", self.cfg["show_paused"], self.save_opts)
         self.tg_auto = PToggle(box, "Запускать вместе с Windows", self.cfg["autostart"], self.save_opts)
-        for t in (self.tg_fcover, self.tg_cover, self.tg_ffirst, self.tg_pause, self.tg_auto):
+        for t in (self.tg_fcover, self.tg_cover, self.tg_ytm, self.tg_ffirst, self.tg_pause, self.tg_auto):
             t.pack(fill="x", pady=2)
 
         drow = tk.Frame(box, bg=C["panel"])
@@ -2848,6 +3010,7 @@ class App(tk.Tk):
         self.cfg["covers"] = self.tg_cover.value
         self.cfg["file_covers"] = self.tg_fcover.value
         self.cfg["cover_order"] = "file" if self.tg_ffirst.value else "itunes"
+        self.cfg["ytmusic"] = self.tg_ytm.value
         self.cfg["show_paused"] = self.tg_pause.value
         if self.tg_auto.value != self.cfg["autostart"]:
             try:
