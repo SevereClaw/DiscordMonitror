@@ -2511,7 +2511,7 @@ class App(tk.Tk):
         if key == "history":
             self.refresh_history()
         elif key == "status":
-            self.render_preview()
+            self.refresh_presets()
 
     def entry(self, master, var, width=22):
         return tk.Entry(master, textvariable=var, width=width, font=(SANS, 10), bg=C["bg"],
@@ -2636,53 +2636,143 @@ class App(tk.Tk):
               "app": "Spotify", "playing": True, "time": 75, "length": 287,
               "fav": "♥", "ab": "", "skin": "Флешка"}
 
+    # заготовки: (ключ, название, верхняя строка, нижняя строка, подсказка на обложке, что под ником)
+    STATUS_PRESETS = (
+        ("classic", "Название и исполнитель", "{title}", "{artist}", "{album}", "state"),
+        ("artist_first", "Исполнитель — название", "{artist} — {title}", "{album}", "{album}", "details"),
+        ("with_album", "С альбомом", "{title}", "{artist} · {album}", "{album}", "state"),
+        ("with_app", "С названием плеера", "{title}", "{artist} · {app}", "{album}", "state"),
+        ("fav", "С сердечком для любимых", "{fav} {title}", "{artist}", "{album}", "state"),
+        ("minimal", "Только название", "{title}", "{app}", "{artist}", "details"),
+    )
+    LIST_LABELS = (("state", "нижнюю строку"), ("details", "верхнюю строку"), ("name", "имя приложения"))
+
+    def current_preset(self):
+        c = self.cfg
+        for key, _n, d, st, lg, ls in self.STATUS_PRESETS:
+            if (c.get("fmt_details"), c.get("fmt_state"), c.get("fmt_large"), c.get("list_shows", "state")) \
+                    == (d, st, lg, ls):
+                return key
+        return "custom"
+
     def build_status_tab(self, holder):
-        outer, box = frame_box(holder, "Что писать в статусе")
+        outer, box = frame_box(holder, "Как выглядит статус")
+        tk.Label(box, text="Выбери вариант — применится сразу:", bg=C["panel"], fg=C["muted"],
+                 font=(SANS, 9)).pack(anchor="w", pady=(0, 4))
+        grid = tk.Frame(box, bg=C["panel"])
+        grid.pack(fill="x")
+        self.preset_cards = {}
+        t = self.sample_track()
+        for i, (key, name, d, st, _lg, _ls) in enumerate(self.STATUS_PRESETS):
+            card = tk.Frame(grid, bg=C["panel2"], padx=10, pady=6, cursor="hand2",
+                            highlightthickness=1, highlightbackground=C["line"])
+            card.grid(row=i // 2, column=i % 2, sticky="nsew", padx=(0 if i % 2 == 0 else 6, 0), pady=3)
+            title = tk.Label(card, text=name, bg=C["panel2"], fg=C["cream"], font=(SANS, 10, "bold"),
+                             anchor="w", cursor="hand2")
+            title.pack(fill="x")
+            ex = tk.Label(card, text="", bg=C["panel2"], fg=C["muted"], font=(SANS, 8), anchor="w",
+                          justify="left", cursor="hand2")
+            ex.pack(fill="x")
+            for w in (card, title, ex):
+                w.bind("<Button-1>", lambda e, k=key: self.apply_status_preset(k))
+            self.preset_cards[key] = (card, title, ex)
+        grid.columnconfigure(0, weight=1)
+        grid.columnconfigure(1, weight=1)
+
+        tk.Label(box, text="ТАК УВИДЯТ ДРУЗЬЯ", bg=C["panel"], fg=C["gold"],
+                 font=(SERIF, 9, "bold")).pack(anchor="w", pady=(10, 4))
+        self.preview = tk.Frame(box, bg="#2b2d31", padx=10, pady=8)
+        self.preview.pack(fill="x")
+
+        # свой вариант — свёрнут
+        self.custom_btn = tk.Label(box, text="", bg=C["panel"], fg=C["glow"], font=(SANS, 9, "underline"),
+                                   cursor="hand2", anchor="w")
+        self.custom_btn.pack(anchor="w", pady=(10, 0))
+        self.custom_btn.bind("<Button-1>", lambda e: self.toggle_custom())
+        self.custom_box = tk.Frame(box, bg=C["panel"])
         self.tpl_vars = {}
         self.focused_tpl = None
-        for key, label in (("fmt_details", "Строка 1"), ("fmt_state", "Строка 2"),
-                           ("fmt_large", "На обложке")):
-            row = tk.Frame(box, bg=C["panel"])
+        for key, label in (("fmt_details", "Верхняя строка"), ("fmt_state", "Нижняя строка"),
+                           ("fmt_large", "Подсказка на обложке")):
+            row = tk.Frame(self.custom_box, bg=C["panel"])
             row.pack(fill="x", pady=2)
-            tk.Label(row, text=label, bg=C["panel"], fg=C["cream"], font=(SANS, 10),
-                     width=10, anchor="w").pack(side="left")
+            tk.Label(row, text=label, bg=C["panel"], fg=C["cream"], font=(SANS, 9),
+                     width=19, anchor="w").pack(side="left")
             var = tk.StringVar(value=self.cfg.get(key, DEFAULT_CFG[key]))
             e = self.entry(row, var)
-            e.pack(side="left", fill="x", expand=True, ipady=3)
+            e.pack(side="left", fill="x", expand=True, ipady=2)
             e.bind("<FocusIn>", lambda ev, w=e: setattr(self, "focused_tpl", w))
             e.bind("<KeyRelease>", lambda ev: self.render_preview())
             self.tpl_vars[key] = var
-
-        chips = tk.Frame(box, bg=C["panel"])
-        chips.pack(fill="x", pady=(6, 0))
+        chips = tk.Frame(self.custom_box, bg=C["panel"])
+        chips.pack(fill="x", pady=(4, 0))
         tk.Label(chips, text="вставить:", bg=C["panel"], fg=C["muted"], font=(SANS, 8)).pack(side="left")
-        for k in ("title", "artist", "album", "app", "lyrics", "fav", "ab", "skin"):
-            c = tk.Label(chips, text="{" + k + "}", bg=C["panel2"], fg=C["glow"], font=("Consolas", 9),
-                         padx=5, cursor="hand2")
-            c.pack(side="left", padx=3)
+        for k, nice in (("title", "название"), ("artist", "исполнитель"), ("album", "альбом"),
+                        ("app", "плеер"), ("fav", "♥"), ("lyrics", "текст"), ("ab", "A–B"), ("skin", "скин")):
+            c = tk.Label(chips, text=nice, bg=C["panel2"], fg=C["glow"], font=(SANS, 8), padx=6, cursor="hand2")
+            c.pack(side="left", padx=2)
             c.bind("<Button-1>", lambda ev, k=k: self.insert_placeholder(k))
-
-        tk.Label(box, text="В списке участников «Слушает …» показывать:", bg=C["panel"], fg=C["cream"],
-                 font=(SANS, 9)).pack(anchor="w", pady=(10, 2))
-        lrow = tk.Frame(box, bg=C["panel"])
-        lrow.pack(fill="x")
+        lrow = tk.Frame(self.custom_box, bg=C["panel"])
+        lrow.pack(fill="x", pady=(8, 0))
+        tk.Label(lrow, text="Под ником в списке:", bg=C["panel"], fg=C["cream"], font=(SANS, 9)).pack(side="left")
         self.list_toggles = {}
-        for key, text in (("state", "строку 2"), ("details", "строку 1"), ("name", "имя приложения")):
-            t = PToggle(lrow, text, self.cfg.get("list_shows", "state") == key,
-                        lambda k=key: self.set_list_shows(k))
-            t.pack(side="left", padx=(0, 14))
-            self.list_toggles[key] = t
-
-        brow = tk.Frame(box, bg=C["panel"])
-        brow.pack(fill="x", pady=(10, 0))
-        PButton(brow, "Сохранить", self.save_templates, accent=True).pack(side="left", fill="x", expand=True, padx=(0, 6))
-        PButton(brow, "Как было", self.reset_templates).pack(side="left", fill="x", expand=True)
-
-        tk.Label(box, text="ТАК УВИДЯТ ДРУЗЬЯ", bg=C["panel"], fg=C["gold"],
-                 font=(SERIF, 9, "bold")).pack(anchor="w", pady=(12, 4))
-        self.preview = tk.Frame(box, bg="#2b2d31", padx=10, pady=8)
-        self.preview.pack(fill="x")
+        for key, text in self.LIST_LABELS:
+            tg = PToggle(lrow, text, self.cfg.get("list_shows", "state") == key,
+                         lambda k=key: self.set_list_shows(k))
+            tg.pack(side="left", padx=(10, 0))
+            self.list_toggles[key] = tg
+        PButton(self.custom_box, "Сохранить свой вариант", self.save_templates, accent=True).pack(fill="x", pady=(8, 0))
+        self.custom_open = self.current_preset() == "custom"
+        self.refresh_presets()
         return outer
+
+    def sample_track(self):
+        t = dict(self.SAMPLE)
+        if self.current:
+            t.update({k: self.current.get(k, "") or t.get(k, "") for k in ("title", "artist", "album", "app")})
+        t["fav"] = "♥"
+        return t
+
+    def refresh_presets(self):
+        if not hasattr(self, "preset_cards"):
+            return
+        cur = self.current_preset()
+        t = self.sample_track()
+        for key, name, d, st, _lg, _ls in self.STATUS_PRESETS:
+            card, title, ex = self.preset_cards[key]
+            on = key == cur
+            bg = C["red"] if on else C["panel2"]
+            for w in (card, title, ex):
+                w.config(bg=bg)
+            card.config(highlightbackground=C["gold"] if on else C["line"])
+            title.config(text=("◆ " if on else "") + name)
+            ex.config(text=(render_tpl(d, t) or t["title"])[:38] + "\n" + (render_tpl(st, t) or "")[:38],
+                      fg=C["cream"] if on else C["muted"])
+        self.custom_btn.config(text=("▾ Свой вариант (выбран)" if cur == "custom" else "▾ Свой вариант")
+                               if self.custom_open else
+                               ("▸ Свой вариант (выбран) — настроить" if cur == "custom" else "▸ Свой вариант…"))
+        if self.custom_open:
+            self.custom_box.pack(fill="x", pady=(4, 0))
+        else:
+            self.custom_box.pack_forget()
+        self.render_preview()
+
+    def toggle_custom(self):
+        self.custom_open = not self.custom_open
+        self.refresh_presets()
+
+    def apply_status_preset(self, key):
+        p = next(x for x in self.STATUS_PRESETS if x[0] == key)
+        _k, name, d, st, lg, ls = p
+        self.cfg.update(fmt_details=d, fmt_state=st, fmt_large=lg, list_shows=ls)
+        for k, v in (("fmt_details", d), ("fmt_state", st), ("fmt_large", lg)):
+            self.tpl_vars[k].set(v)
+        for k, tg in self.list_toggles.items():
+            tg.value = (k == ls)
+            tg.render()
+        self.push_cfg()
+        self.status_lbl.config(text=f"Статус: «{name}»")
+        self.refresh_presets()
 
     def insert_placeholder(self, key):
         e = self.focused_tpl
@@ -2718,7 +2808,7 @@ class App(tk.Tk):
         shown = {"state": state, "details": details, "name": "<имя приложения в Discord>"}
         D_BG, D_FG, D_MUT = "#2b2d31", "#f2f3f5", "#b5bac1"
 
-        tk.Label(self.preview, text="в списке: Слушает " + shown[cfg.get("list_shows", "state")],
+        tk.Label(self.preview, text="под ником: Слушает " + shown[cfg.get("list_shows", "state")],
                  bg=D_BG, fg=D_MUT, font=(SANS, 8, "italic"), anchor="w").pack(fill="x")
         body = tk.Frame(self.preview, bg=D_BG)
         body.pack(fill="x", pady=(4, 0))
@@ -2730,7 +2820,7 @@ class App(tk.Tk):
         txt = tk.Frame(body, bg=D_BG)
         txt.pack(side="left", fill="x", expand=True, padx=(10, 0))
         for text, font, fg in ((details, (SANS, 10, "bold"), D_FG), (state, (SANS, 9), D_FG),
-                               (f"обложка: {large}", (SANS, 8), D_MUT),
+                               (f"на обложке: {large}", (SANS, 8), D_MUT),
                                ("1:15 ━━━━━─────── 4:47", (SANS, 8), D_MUT)):
             tk.Label(txt, text=text[:60], bg=D_BG, fg=fg, font=font, anchor="w").pack(fill="x")
         for bid in self.cfg.get("buttons", []):
@@ -2744,7 +2834,7 @@ class App(tk.Tk):
             t.render()
         self.cfg["list_shows"] = key
         self.push_cfg()
-        self.render_preview()
+        self.refresh_presets()
 
     def save_templates(self):
         for k, v in self.tpl_vars.items():
@@ -2756,7 +2846,8 @@ class App(tk.Tk):
                 return
             self.cfg[k] = tpl
         self.push_cfg()
-        self.status_lbl.config(text="Формат статуса сохранён")
+        self.status_lbl.config(text="Свой вариант статуса сохранён")
+        self.refresh_presets()
 
     def reset_templates(self):
         for k, v in self.tpl_vars.items():

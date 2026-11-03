@@ -49,6 +49,18 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: python tests/test_ytmusic.py
 
+      - name: UI screenshots (status tab)
+        continue-on-error: true
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python tests/ui_shot.py "$env:RUNNER_TEMP\shots\status.png"
+
+      - uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: ui-shots
+          path: ${{ runner.temp }}/shots
+
       - name: Stamp build number (for auto-update)
         shell: pwsh
         run: Set-Content -Path build_info.py -Value "BUILD = ${{ github.run_number }}" -Encoding ascii
