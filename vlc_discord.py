@@ -1236,9 +1236,22 @@ def ytm_search(query, songs=True, timeout=8):
         return ytm_parse(json.loads(r.read().decode("utf-8")))
 
 
-def ytm_best(items, title, artist, length=0):
-    """Самый похожий трек: название, исполнитель, длительность."""
-    want_t, want_a = _norm_t(title), _norm_t(artist)
+YTM_EXTRA = ("live", "концерт", "remix", "ремикс", "cover", "кавер", "instrumental", "минус",
+             "karaoke", "караоке", "sped up", "slowed", "nightcore", "8d")
+
+
+def core_title(title):
+    """«Песня -opening movie version» / «Песня (Live)» → «Песня»."""
+    t = re.split(r"\s+[-–—]\s*|\s*[\(\[]", title or "", maxsplit=1)[0]
+    return t.strip() or (title or "")
+
+
+def ytm_best(items, title, artist, length=0, album="", loose=False):
+    """Самый похожий трек: название, исполнитель, альбом, длительность.
+    loose — сравнивать только основу названия (без приписок в скобках и после « - »)."""
+    want_t = _norm_t(core_title(title) if loose else title)
+    want_a, want_al = _norm_t(artist), _norm_t(album)
+    asked = (title or "").casefold()
     best, score = None, -1
     for it in items:
         nt, na = _norm_t(it["title"]), _norm_t(it["artist"])
@@ -1247,6 +1260,11 @@ def ytm_best(items, title, artist, length=0):
         sc = 2
         if want_a and (want_a in na or na in want_a):
             sc += 3
+        if want_al and want_al in _norm_t(it.get("album")):
+            sc += 2
+        low = it["title"].casefold() + " " + (it.get("album") or "").casefold()
+        if any(w in low and w not in asked for w in YTM_EXTRA):
+            sc -= 3                           # концерт / ремикс / кавер, а просили не их
         if length and it["dur"]:
             d = abs(it["dur"] - length)
             if d > 20:
@@ -1279,7 +1297,8 @@ class YTMusic:
             if key in self.busy:
                 return None
             self.busy.add(key)
-        threading.Thread(target=self._find, args=(key, title, artist, int(track.get("length") or 0)),
+        threading.Thread(target=self._find, args=(key, title, artist, int(track.get("length") or 0),
+                                                  (track.get("album") or "").strip()),
                          daemon=True).start()
         return None
 
@@ -1287,13 +1306,19 @@ class YTMusic:
         return ((track.get("artist") or "").strip().casefold(),
                 (track.get("title") or "").strip().casefold()) in self.busy
 
-    def _find(self, key, title, artist, length):
+    def _find(self, key, title, artist, length, album=""):
         found = None
         try:
             q = f"{artist} {title}".strip()
-            found = ytm_best(ytm_search(q), title, artist, length)
+            res = ytm_search(q)
+            found = ytm_best(res, title, artist, length, album)
             if not found:                                  # без фильтра «Песни»
-                found = ytm_best(ytm_search(q, songs=False), title, artist, length)
+                res2 = ytm_search(q, songs=False)
+                found = ytm_best(res2, title, artist, length, album)
+            if not found and core_title(title) != title:   # по основе названия, без приписок
+                res3 = ytm_search(f"{artist} {core_title(title)}".strip())
+                found = (ytm_best(res3, title, artist, length, album, loose=True)
+                         or ytm_best(res + res3, title, artist, length, album, loose=True))
             self.status = ""
         except Exception as e:
             self.status = f"{type(e).__name__}"
