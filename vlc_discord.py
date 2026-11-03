@@ -72,6 +72,9 @@ DEFAULT_CFG = {
     "multi": "auto",            # музыка и видео сразу: auto | music | video | both
     "client_id_video": "",      # второе приложение Discord — для карточки «Смотрит» (режим both)
     "video_image": "",          # картинка видео, если нет превью: ключ Art Assets второго приложения или https
+    "vpn_card": True,           # карточка «VPN» из NekoBoxP3R (страна, время, ссылка на репозиторий)
+    "client_id_vpn": "",        # третье приложение Discord — для карточки VPN
+    "vpn_show_server": True,    # показывать название сервера во второй строке
     "ignore_apps": [],
     "fallback_image": "logo",   # ключ картинки из Art Assets в Discord или https-ссылка
     "badge": "none",            # значок в углу обложки: none | logo | app
@@ -1491,6 +1494,73 @@ def build_video_activity(track, cfg, thumb=None):
     return act
 
 
+# ───────────────────────── VPN из NekoBoxP3R ─────────────────────────
+NEKO_STATUS = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "NekoBoxP3R", "status.json")
+NEKO_REPO = "https://github.com/SevereClaw/NekoBoxP3R"
+NEKO_LOGO = "https://raw.githubusercontent.com/SevereClaw/NekoBoxP3R/main/res/public/nekobox.png"
+COUNTRY_RU = {
+    "DE": "Германия", "NL": "Нидерланды", "FI": "Финляндия", "SE": "Швеция", "NO": "Норвегия", "DK": "Дания",
+    "FR": "Франция", "IT": "Италия", "ES": "Испания", "PT": "Португалия", "GB": "Великобритания", "IE": "Ирландия",
+    "BE": "Бельгия", "LU": "Люксембург", "CH": "Швейцария", "AT": "Австрия", "PL": "Польша", "CZ": "Чехия",
+    "HU": "Венгрия", "RO": "Румыния", "BG": "Болгария", "LT": "Литва", "LV": "Латвия", "EE": "Эстония",
+    "UA": "Украина", "MD": "Молдова", "RU": "Россия", "KZ": "Казахстан", "TR": "Турция", "AM": "Армения",
+    "GE": "Грузия", "AE": "ОАЭ", "IL": "Израиль", "US": "США", "CA": "Канада", "JP": "Япония", "KR": "Корея",
+    "SG": "Сингапур", "HK": "Гонконг", "IN": "Индия", "AU": "Австралия", "BR": "Бразилия", "RS": "Сербия",
+    "GR": "Греция", "CY": "Кипр", "IS": "Исландия", "SK": "Словакия", "SI": "Словения", "HR": "Хорватия",
+}
+VPN_MODES = {"vpn": "VPN для всех программ", "proxy": "браузер и программы", "port": "локальный порт"}
+
+
+def flag_emoji(code):
+    code = (code or "").upper()
+    if len(code) != 2 or not code.isalpha():
+        return "🌐"
+    return "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in code)
+
+
+def read_neko_status():
+    """Состояние из NekoBoxP3R (файл обновляется раз в 30 с и при каждом подключении)."""
+    try:
+        with open(NEKO_STATUS, encoding="utf-8") as f:
+            st = json.load(f)
+    except Exception:
+        return None
+    if not st.get("connected"):
+        return None
+    if time.time() - float(st.get("updated") or 0) > 100:      # NekoBoxP3R закрыт или завис
+        return None
+    return st
+
+
+def build_vpn_activity(st, cfg):
+    code = (st.get("country") or "").upper()
+    cname = COUNTRY_RU.get(code, st.get("country_name") or code or "VPN")
+    mode = VPN_MODES.get(st.get("mode"), "")
+    repo = (st.get("repo") or NEKO_REPO)[:256]
+    second = " · ".join(x for x in ((st.get("server") if cfg.get("vpn_show_server", True) else ""), mode) if x)
+    act = {
+        "type": 0,
+        "name": "NekoBoxP3R",
+        "details": fit(f"🛡 VPN · {flag_emoji(code)} {cname}"),
+        "state": fit(second or "NekoBoxP3R"),
+        "details_url": repo,
+        "state_url": repo,
+        "assets": {
+            "large_image": f"https://flagcdn.com/w320/{code.lower()}.png" if len(code) == 2 else NEKO_LOGO,
+            "large_text": fit(cname),
+            "large_url": repo,
+            "small_image": NEKO_LOGO,
+            "small_text": fit("NekoBoxP3R " + str(st.get("version") or "")),
+        },
+        "buttons": [{"label": "🛡 NekoBoxP3R на GitHub", "url": repo}],
+        "instance": False,
+    }
+    since = int(st.get("since") or 0)
+    if since > 0:
+        act["timestamps"] = {"start": since * 1000}       # Discord сам считает «прошло 00:42:13»
+    return act
+
+
 # ───────────────────────── история прослушиваний ─────────────────────────
 DB_PATH = os.path.join(CFG_DIR, "history.db")
 
@@ -1736,6 +1806,8 @@ class Worker(threading.Thread):
         # вторая карточка — «Смотрит» (режим «обе карточки»)
         self.vipc, self.v_key, self.v_start, self.v_shown = None, None, None, False
         self.v_note = ""
+        # третья карточка — VPN из NekoBoxP3R
+        self.nipc, self.n_key, self.n_shown, self.n_note, self.n_pid = None, None, False, "", None
 
     def status(self, state, text, track=None):
         self.q.put({"state": state, "text": text, "track": track, "sessions": self.sessions})
@@ -1850,6 +1922,7 @@ class Worker(threading.Thread):
                     self.lastfm.flush()
 
     def tick(self):
+        self.tick_vpn()
         cands, http_ok = self.collect()
         cands = [fill_video_time(c) for c in cands]
         if not self.cfg.get("show_paused"):
@@ -1884,13 +1957,13 @@ class Worker(threading.Thread):
             self.hide_activity()
             if self.v_shown:
                 self.status("live", ("Показываю видео" if self.cfg.get("multi") == "video"
-                                     else "Музыки нет") + self.v_note, None)
+                                     else "Музыки нет") + self.v_note + self.n_note, None)
             elif cands and not main and visible:
-                self.status("idle", "Сейчас только видео — его карточка ниже" + self.v_note)
+                self.status("idle", "Сейчас только видео — его карточка ниже" + (self.v_note + self.n_note))
             elif cands:
-                self.status("hidden", "В чёрном списке — не показываю", self.pick(cands))
+                self.status("hidden", "В чёрном списке — не показываю" + self.n_note, self.pick(cands))
             else:
-                self.status("idle", "Ничего не играет")
+                self.status("idle", "Ничего не играет" + self.n_note)
             return
 
         if self.hidden:
@@ -1972,10 +2045,47 @@ class Worker(threading.Thread):
             note += " · кнопки ✓ (видят друзья, не ты)"
         elif bs == "rejected":
             note += " · кнопки Discord не принял"
-        note += self.v_note
+        note += self.v_note + self.n_note
         self.status("live" if track["playing"] else "paused",
                     ("В эфире" if track["playing"] else "На паузе") + f" · {track['app']}" + note,
                     track)
+
+    def tick_vpn(self):
+        """Карточка «VPN» через третье приложение Discord; данные — из NekoBoxP3R."""
+        cid = (self.cfg.get("client_id_vpn") or "").strip()
+        st = read_neko_status() if self.cfg.get("vpn_card", True) and cid and not self.hidden else None
+        try:
+            if st is None:
+                if self.nipc and self.n_shown:
+                    self.nipc.set_activity(None)
+                self.n_shown, self.n_key = False, None
+                if self.nipc and (not cid or not self.cfg.get("vpn_card", True)):
+                    self.nipc.close()
+                    self.nipc = None
+                self.n_note = ("" if not cid or not self.cfg.get("vpn_card", True) else
+                               "\n🛡 VPN: скрыт (невидимка)" if self.hidden else "\n🛡 VPN: не подключён")
+                return
+            pid = int(st.get("pid") or 0) or None
+            if self.nipc and pid != self.n_pid:          # NekoBoxP3R перезапустился — новое подключение
+                self.nipc.close()
+                self.nipc = None
+            if not self.nipc:
+                # карточка привязана к процессу NekoBoxP3R: закрыл VPN — Discord сам её убрал
+                self.nipc = DiscordIPC(cid, pid=pid or os.getpid() + 2)
+                self.nipc.connect()
+                self.n_pid, self.n_key = pid, None
+            key = (st.get("country"), st.get("server"), st.get("mode"), st.get("since"),
+                   self.cfg.get("vpn_show_server", True))
+            if key != self.n_key:
+                self.nipc.set_activity(build_vpn_activity(st, self.cfg))
+                self.n_key, self.n_shown = key, True
+            code = (st.get("country") or "").upper()
+            self.n_note = f"\n🛡 VPN: {COUNTRY_RU.get(code, code)} · {st.get('server', '')[:30]}"
+        except Exception as e:
+            if self.nipc:
+                self.nipc.close()
+            self.nipc, self.n_key, self.n_shown = None, None, False
+            self.n_note = f"\n🛡 VPN-карточка: {e}"[:90]
 
     def tick_video(self, track, enabled):
         """Карточка «Смотрит …» через второе приложение Discord."""
@@ -2028,6 +2138,13 @@ class Worker(threading.Thread):
             pass
         try:
             self.tick_video(None, False)
+        except Exception:
+            pass
+        try:
+            if self.nipc and self.n_shown:
+                self.nipc.set_activity(None)
+            if self.nipc:
+                self.nipc.close()
         except Exception:
             pass
         if self.ipc:
@@ -3102,6 +3219,26 @@ class App(tk.Tk):
                  bg=C["panel"], fg=C["muted"], font=(SANS, 8)).pack(anchor="w", pady=(2, 0))
 
         tk.Frame(box, bg=C["line"], height=1).pack(fill="x", pady=10)
+        tk.Label(box, text="VPN ИЗ NEKOBOXP3R", bg=C["panel"], fg=C["gold"],
+                 font=(SERIF, 9, "bold")).pack(anchor="w")
+        self.tg_vpn = PToggle(box, "Показывать в Discord, что я в VPN (страна и время)",
+                              self.cfg.get("vpn_card", True), self.save_vpn_opts)
+        self.tg_vpn.pack(fill="x", pady=2)
+        self.tg_vpn_srv = PToggle(box, "Показывать название сервера",
+                                  self.cfg.get("vpn_show_server", True), self.save_vpn_opts)
+        self.tg_vpn_srv.pack(fill="x", pady=2)
+        nrow = tk.Frame(box, bg=C["panel"])
+        nrow.pack(fill="x", pady=(4, 0))
+        tk.Label(nrow, text="ID приложения для VPN", bg=C["panel"], fg=C["cream"],
+                 font=(SANS, 10)).pack(side="left")
+        self.vpn_var = tk.StringVar(value=self.cfg.get("client_id_vpn", ""))
+        self.entry(nrow, self.vpn_var).pack(side="left", padx=8, ipady=3, fill="x", expand=True)
+        PButton(nrow, "OK", self.save_vpn_id).pack(side="left")
+        PButton(nrow, "?", self.help_vpn_id).pack(side="left", padx=(4, 0))
+        tk.Label(box, text="отдельная карточка «Играет в NekoBoxP3R»: флаг страны, сервер, «прошло 00:42», клик → GitHub",
+                 bg=C["panel"], fg=C["muted"], font=(SANS, 8)).pack(anchor="w", pady=(2, 0))
+
+        tk.Frame(box, bg=C["line"], height=1).pack(fill="x", pady=10)
         row = tk.Frame(box, bg=C["panel"])
         row.pack(fill="x")
         tk.Label(row, text="Не брать из", bg=C["panel"], fg=C["cream"], font=(SANS, 10)).pack(side="left")
@@ -3176,6 +3313,43 @@ class App(tk.Tk):
         else:
             self.push_cfg()
         self.status_lbl.config(text="ID для видео сохранён")
+
+    def save_vpn_opts(self):
+        self.cfg["vpn_card"] = self.tg_vpn.value
+        self.cfg["vpn_show_server"] = self.tg_vpn_srv.value
+        if self.tg_vpn.value and not (self.cfg.get("client_id_vpn") or "").strip():
+            self.show_window()
+            self.help_vpn_id()
+        self.push_cfg()
+        if self.worker:
+            self.worker.n_key = None
+
+    def save_vpn_id(self):
+        vid = self.vpn_var.get().strip()
+        if vid and not vid.isdigit():
+            messagebox.showwarning(APP_NAME, "Application ID — это только цифры.")
+            return
+        if vid and vid in (self.cfg.get("client_id", ""), self.cfg.get("client_id_video", "")):
+            messagebox.showwarning(APP_NAME, "Нужен ДРУГОЙ ID, не тот, что для музыки или видео: "
+                                             "Discord показывает одну карточку на приложение.")
+            return
+        self.cfg["client_id_vpn"] = vid
+        self.push_cfg()
+        if self.worker:
+            self.worker.n_key = None
+        self.status_lbl.config(text="ID для VPN сохранён" if vid else "Карточка VPN выключена")
+
+    def help_vpn_id(self):
+        messagebox.showinfo("Карточка VPN из NekoBoxP3R",
+            "Discord показывает одну карточку на одно приложение, поэтому для VPN нужно своё:\n\n"
+            "1. discord.com/developers/applications → New Application → назови «NekoBoxP3R»\n"
+            "   (будет «Играет в NekoBoxP3R»).\n"
+            "2. Скопируй его Application ID и вставь в поле «ID приложения для VPN» → OK.\n\n"
+            "Карточка появляется, когда NekoBoxP3R подключён, и пропадает, когда отключаешься\n"
+            "или закрываешь его. Показывает флаг и страну, сервер и режим, время подключения.\n"
+            "Клик по названию, картинке или кнопке открывает репозиторий NekoBoxP3R на GitHub\n"
+            "(кнопку видят друзья, ты в своём профиле её не видишь — так устроен Discord).\n\n"
+            "Нужен NekoBoxP3R v0.19.0 или новее.")
 
     def help_video_id(self):
         messagebox.showinfo("Две карточки: музыка и видео",
