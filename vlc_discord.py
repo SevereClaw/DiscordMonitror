@@ -2155,22 +2155,84 @@ class Worker(threading.Thread):
 
 
 # ───────────────────────── автозапуск ─────────────────────────
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+# сюда Windows пишет, выключен ли пункт в «Диспетчер задач → Автозагрузка» (02 — вкл, 03 — выкл)
+APPROVED_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+RUN_NAME = "VLCDiscord"
+
+
+def autostart_cmd():
+    # --autostart: подождать, пока Windows догрузит панель задач (иначе значка в трее нет)
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}" --minimized --autostart'
+    pyw = sys.executable.replace("python.exe", "pythonw.exe")
+    return f'"{pyw}" "{os.path.abspath(__file__)}" --minimized --autostart'
+
+
+def _approve(enabled):
+    import winreg
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, APPROVED_KEY) as k:
+        winreg.SetValueEx(k, RUN_NAME, 0, winreg.REG_BINARY, bytes([2 if enabled else 3]) + bytes(11))
+
+
 def set_autostart(on):
     import winreg
-    path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-    if getattr(sys, "frozen", False):
-        cmd = f'"{sys.executable}" --minimized'
-    else:
-        pyw = sys.executable.replace("python.exe", "pythonw.exe")
-        cmd = f'"{pyw}" "{os.path.abspath(__file__)}" --minimized'
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_SET_VALUE) as k:
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
         if on:
-            winreg.SetValueEx(k, "VLCDiscord", 0, winreg.REG_SZ, cmd)
+            winreg.SetValueEx(k, RUN_NAME, 0, winreg.REG_SZ, autostart_cmd())
         else:
             try:
-                winreg.DeleteValue(k, "VLCDiscord")
+                winreg.DeleteValue(k, RUN_NAME)
             except FileNotFoundError:
                 pass
+    try:
+        _approve(on)          # галочка в программе включает и пункт в «Автозагрузке» Windows
+    except OSError:
+        pass
+
+
+def autostart_state():
+    """(команда в реестре или None, выключено ли в «Автозагрузке» Windows)."""
+    import winreg
+    cmd, disabled = None, False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            cmd = winreg.QueryValueEx(k, RUN_NAME)[0]
+    except OSError:
+        pass
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, APPROVED_KEY) as k:
+            data = winreg.QueryValueEx(k, RUN_NAME)[0]
+            disabled = bool(data) and data[0] % 2 == 1      # нечётный первый байт — выключено
+    except OSError:
+        pass
+    return cmd, disabled
+
+
+def sync_autostart(cfg):
+    """При каждом запуске: путь в реестре — к этому exe (его могли перенести или переименовать).
+    Возвращает подсказку для строки статуса или пустую строку."""
+    if sys.platform != "win32":
+        return ""
+    try:
+        if not cfg.get("autostart_fixed_v2") and cfg.get("autostart"):
+            set_autostart(True)                 # починка старых установок: путь, флаг Windows, задержка
+            cfg["autostart_fixed_v2"] = True
+            save_cfg(cfg)
+            return ""
+        cfg.setdefault("autostart_fixed_v2", True)
+        cmd, disabled = autostart_state()
+        if not cfg.get("autostart"):
+            return ""
+        if disabled:
+            cfg["autostart"] = False
+            save_cfg(cfg)
+            return "Автозапуск был выключен в «Автозагрузке» Windows — включи галочку снова, если нужен"
+        if cmd != autostart_cmd():
+            set_autostart(True)
+    except Exception as e:
+        return f"Автозапуск: {e}"[:80]
+    return ""
 
 
 # ───────────────────────── оформление ─────────────────────────
@@ -2578,6 +2640,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.cfg = load_cfg()
+        self.autostart_note = sync_autostart(self.cfg)   # путь в реестре всегда к этому exe
         save_cfg(self.cfg)
         self.q = queue.Queue()
         self.worker = None
@@ -2630,6 +2693,8 @@ class App(tk.Tk):
                 self.iconify()
         if "--updated" in sys.argv and self.tray:
             self.after(2500, lambda: self.tray.notify(f"Обновлено до сборки {self.build}."))
+        if self.autostart_note:
+            self.after(3000, lambda: self.status_lbl.config(text=self.autostart_note))
 
     # ── шапка ──
     def build_header(self):
@@ -3831,5 +3896,28 @@ class App(tk.Tk):
         self.destroy()
 
 
+def already_running():
+    """Одна копия программы: именованный мьютекс Windows (освобождается сам при выходе)."""
+    if sys.platform != "win32":
+        return False
+    try:
+        k32 = ctypes.windll.kernel32
+        k32.CreateMutexW.restype = ctypes.wintypes.HANDLE
+        globals()["_SINGLE_MUTEX"] = k32.CreateMutexW(None, False, "Local\\MusicDiscordMonitor")
+        return k32.GetLastError() == 183           # ERROR_ALREADY_EXISTS
+    except Exception:
+        return False
+
+
 if __name__ == "__main__":
+    if "--autostart" in sys.argv:
+        time.sleep(20)      # при входе в Windows: дождаться панели задач, сети и Discord
+    if already_running() and "--updated" not in sys.argv:
+        if "--autostart" not in sys.argv:
+            try:
+                ctypes.windll.user32.MessageBoxW(None, "Music → Discord уже запущен — он в трее (возле часов).",
+                                                 "Music → Discord", 0x40)
+            except Exception:
+                pass
+        sys.exit(0)
     App().mainloop()
