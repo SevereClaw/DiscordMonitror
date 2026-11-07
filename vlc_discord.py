@@ -68,6 +68,8 @@ DEFAULT_CFG = {
     "buttons": ["youtube", "yandex"],
     "hotkey": "Ctrl+Alt+H",
     "blacklist": [],
+    "hidden_sites": None,          # None — список по умолчанию (HIDDEN_SITES_DEFAULT)
+    "hide_unknown_sites": True,    # видео из браузера, пока не понятно, с какого оно сайта, — не показывать
     "source_mode": "auto",      # auto | vlc | system
     "multi": "auto",            # музыка и видео сразу: auto | music | video | both
     "client_id_video": "",      # второе приложение Discord — для карточки «Смотрит» (режим both)
@@ -458,6 +460,38 @@ def _same_song(a, b):
 
 
 # ───────────────────────── чёрный список ─────────────────────────
+HIDDEN_SITES_DEFAULT = [
+    "rule34archive.com", "rule34.xxx", "rule34video.com", "rule34.paheal.net", "rule34",
+    "pornhub", "xvideos", "xnxx", "xhamster", "redtube", "youporn", "spankbang", "eporner",
+    "hentai", "nhentai", "onlyfans", "porn", "порно",
+]
+
+
+def hidden_sites(cfg):
+    v = cfg.get("hidden_sites")
+    return HIDDEN_SITES_DEFAULT if v is None else v
+
+
+def is_hidden_site(track, cfg):
+    """Видео с сайта из списка «Скрытые сайты» — не показывать нигде (ни в Discord, ни в истории).
+    Проверяем адрес вкладки, а также название и канал (у таких сайтов в заголовке часто их имя).
+    Пока не понятно, с какого сайта видео, и включено «неизвестные не показывать» — тоже скрываем."""
+    if not is_video(track):
+        return False
+    info = VIDEO_LINKS.get(track) or {}
+    host = (urllib.parse.urlsplit(info.get("url") or "").hostname or "").lower()
+    hay = " ".join([track.get("title", ""), track.get("artist", ""), track.get("album", "")]).lower()
+    for p in hidden_sites(cfg):
+        p = p.strip().lower()
+        if not p or p.startswith("#"):
+            continue
+        if (host and (p in host)) or p.replace(".com", "").replace(".xxx", "") in hay:
+            return True
+    if not info and cfg.get("hide_unknown_sites", True):
+        return True                       # ещё не знаем сайт — лучше подождать, чем показать лишнее
+    return False
+
+
 def is_blacklisted(track, patterns):
     """Строка с \\ / или : — папка/путь; иначе — кусок названия, исполнителя или имени файла."""
     hay = " ".join([track.get("artist", ""), track.get("title", ""),
@@ -1131,7 +1165,7 @@ def youtube_search(title, channel=""):
         nt = _norm_t(t)
         if want and (want in nt or nt in want):
             return vid
-    return first
+    return None          # не угадываем: «первый попавшийся» мог бы показать чужое видео
 
 
 def youtube_length(vid):
@@ -1177,7 +1211,7 @@ class VideoLinks:
             if hit is not None:
                 if hit.get("url"):
                     return hit
-                if time.time() - hit.get("_t", 0) < 120:      # не нашли — повторим через 2 минуты
+                if time.time() - hit.get("_t", 0) < 15:       # не нашли — повторим (Firefox пишет вкладки раз в ~15 с)
                     return None
             if key in self.busy:
                 return None
@@ -1925,6 +1959,8 @@ class Worker(threading.Thread):
         self.tick_vpn()
         cands, http_ok = self.collect()
         cands = [fill_video_time(c) for c in cands]
+        # скрытые сайты — убираем совсем: ни статуса, ни истории, ни Last.fm
+        cands = [c for c in cands if not is_hidden_site(c, self.cfg)]
         if not self.cfg.get("show_paused"):
             cands = [c for c in cands if c["playing"]]
         self.sessions = [(c["app"], c["artist"], c["title"], c["playing"]) for c in cands]
@@ -3455,7 +3491,36 @@ class App(tk.Tk):
         row2.pack(fill="x", pady=(8, 0))
         PButton(row2, "Сохранить список", self.save_blacklist).pack(side="left", fill="x", expand=True, padx=(0, 6))
         PButton(row2, "✕ Скрыть этот трек", self.blacklist_current).pack(side="left", fill="x", expand=True)
+
+        tk.Label(box, text="Скрытые сайты — видео с них не попадёт ни в статус, ни в историю.\n"
+                           "По строке: адрес (pornhub.com) или слово из названия сайта (rule34):",
+                 bg=C["panel"], fg=C["muted"], font=(SANS, 9), justify="left").pack(anchor="w", pady=(14, 4))
+        self.hs_text = tk.Text(box, height=5, font=(SANS, 10), bg=C["bg"], fg=C["cream"],
+                               insertbackground=C["glow"], relief="flat", wrap="none",
+                               highlightthickness=1, highlightbackground=C["line"],
+                               highlightcolor=C["blue"])
+        self.hs_text.pack(fill="both", expand=True)
+        self.hs_text.insert("1.0", "\n".join(hidden_sites(self.cfg)))
+        self.tg_unknown = PToggle(box, "Видео с неизвестного сайта не показывать (пока программа не поймёт, откуда оно)",
+                                  self.cfg.get("hide_unknown_sites", True), self.save_hidden_sites)
+        self.tg_unknown.pack(anchor="w", pady=(6, 0))
+        row3 = tk.Frame(box, bg=C["panel"])
+        row3.pack(fill="x", pady=(6, 0))
+        PButton(row3, "Сохранить сайты", self.save_hidden_sites).pack(side="left", fill="x", expand=True, padx=(0, 6))
+        PButton(row3, "Как было", self.reset_hidden_sites).pack(side="left")
         return outer
+
+    def save_hidden_sites(self, *_):
+        lines = [l.strip() for l in self.hs_text.get("1.0", "end").splitlines() if l.strip()]
+        self.cfg["hidden_sites"] = lines
+        self.cfg["hide_unknown_sites"] = self.tg_unknown.value
+        self.push_cfg()
+        self.status_lbl.config(text=f"Скрытые сайты сохранены ({len(lines)})")
+
+    def reset_hidden_sites(self):
+        self.hs_text.delete("1.0", "end")
+        self.hs_text.insert("1.0", "\n".join(HIDDEN_SITES_DEFAULT))
+        self.save_hidden_sites()
 
     # ── действия ──
     def help_id(self):
