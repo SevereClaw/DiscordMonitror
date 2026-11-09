@@ -739,9 +739,28 @@ class DiscordIPC:
         payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.pipe.write(struct.pack("<II", op, len(payload)) + payload)
 
+    def _wait_data(self, timeout):
+        """Ждать ответа Discord не дольше timeout секунд. Без этого, если Discord
+        «задумался» (лимит обновлений), программа висела на чтении — и текст вставал."""
+        if os.name != "nt":
+            return
+        import msvcrt
+        h = msvcrt.get_osfhandle(self.pipe.fileno())
+        avail = ctypes.wintypes.DWORD()
+        end = time.monotonic() + timeout
+        while True:
+            if not ctypes.windll.kernel32.PeekNamedPipe(h, None, 0, None, ctypes.byref(avail), None):
+                raise ConnectionError("Связь с Discord потеряна")
+            if avail.value:
+                return
+            if time.monotonic() > end:
+                raise TimeoutError("Discord не отвечает — переподключаюсь")
+            time.sleep(0.02)
+
     def _read(self, n):
         buf = b""
         while len(buf) < n:
+            self._wait_data(6)
             chunk = self.pipe.read(n - len(buf))
             if not chunk:
                 raise ConnectionError("Связь с Discord потеряна")
@@ -817,7 +836,7 @@ def parse_lrc(text):
 
 
 LYRIC_LEAD = 0.5        # строку шлём чуть раньше: Discord доносит её до друзей ~полсекунды
-DISCORD_BURST = (5, 20.0)   # Discord пропускает до 5 обновлений статуса за 20 с
+LYRIC_GAP = 4.2         # чаще Discord статус не меняет: при пачке обновлений он «застывает»
 
 
 def next_line_at(lines, pos):
@@ -1848,7 +1867,6 @@ class Worker(threading.Thread):
         self.lyrics = Lyrics()
         self.pending_key, self.pending_since = None, 0.0   # защита от пролистывания
         self.last_set, self.last_lyric = 0.0, None
-        self.sends = []              # когда слали статус — для лимита Discord (5 за 20 с)
         self.wake_at = None          # когда проснуться к следующей строке текста
         self.last_src = None
         self.sessions = []
@@ -2094,19 +2112,15 @@ class Worker(threading.Thread):
         start = int(time.time()) - track["time"]
         seeked = (track["length"] > 0 and self.last_start is not None
                   and abs(start - self.last_start) > 3)
-        n_max, window = DISCORD_BURST
-        self.sends = [t for t in self.sends if now - t < window]
-        budget = len(self.sends) < n_max and now - self.last_set >= 1.0
+        budget = now - self.last_set >= LYRIC_GAP
         lyric_due = lyric != self.last_lyric and budget
         self.wake_at = None
-        if lyric != self.last_lyric and not budget and self.sends:
-            # лимит исчерпан — проснуться ровно когда освободится место
-            self.wake_at = max(self.sends[0] + window, self.last_set + 1.0) + 0.05
+        if lyric != self.last_lyric and not budget:
+            self.wake_at = self.last_set + LYRIC_GAP + 0.02   # проснуться, как только можно
         elif next_in is not None:
             self.wake_at = now + max(0.05, next_in)
         if key != self.last_key or seeked or lyric_due:
             self.ipc.set_activity(build_activity(track, self.cfg, lyric))
-            self.sends.append(now)
             self.shown, self.last_key, self.last_start = True, key, start
             self.last_src = track["src"]
             self.last_set, self.last_lyric = now, lyric
@@ -2943,8 +2957,8 @@ class App(tk.Tk):
             t = PToggle(lrow, text, self.cfg.get("lyrics", "off") == key, lambda k=key: self.set_lyrics(k))
             t.pack(side="left", padx=(0, 14))
             self.lyr_toggles[key] = t
-        tk.Label(box, text="Строчки с lrclib.net. Discord пропускает до 5 смен статуса за 20 с, "
-                           "так что на очень быстрых песнях отдельные строки могут проскочить.",
+        tk.Label(box, text="Строчки с lrclib.net. Discord меняет статус не чаще раза в ~4 с, "
+                           "так что на быстрых песнях отдельные строки проскочат.",
                  bg=C["panel"], fg=C["muted"], font=(SANS, 8), wraplength=470,
                  justify="left").pack(anchor="w", pady=(2, 0))
 
