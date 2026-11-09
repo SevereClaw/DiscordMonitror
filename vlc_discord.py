@@ -448,6 +448,7 @@ def read_mp3player():
         "playing": playing, "time": int(min(pos, length) if length else pos), "length": length,
         "src": "mp3player", "app": MP3P_APP, "via": "mp3player",
         "has_lyrics": bool(d.get("has_lyrics")), "lyric": d.get("lyric"),
+        "ptime": pos, "lyric_next": d.get("lyric_next"), "lyric_next_at": d.get("lyric_next_at"),
         "fav": "♥" if d.get("fav") else "", "ab": ("🔁 A–B " + d["ab"]) if d.get("ab") else "",
         "skin": d.get("skin") or "",
         "cover_file": d.get("cover_file") or "", "cover_hash": d.get("cover_hash") or "",
@@ -813,6 +814,18 @@ def parse_lrc(text):
             out.append((int(m) * 60 + float(sec.replace(":", ".")), words))
     out.sort(key=lambda x: x[0])
     return out
+
+
+LYRIC_LEAD = 0.5        # строку шлём чуть раньше: Discord доносит её до друзей ~полсекунды
+DISCORD_BURST = (5, 20.0)   # Discord пропускает до 5 обновлений статуса за 20 с
+
+
+def next_line_at(lines, pos):
+    """Секунда, когда начнётся следующая строка (или None)."""
+    for t, _ in lines:
+        if t > pos:
+            return t
+    return None
 
 
 def current_line(lines, pos):
@@ -1835,6 +1848,8 @@ class Worker(threading.Thread):
         self.lyrics = Lyrics()
         self.pending_key, self.pending_since = None, 0.0   # защита от пролистывания
         self.last_set, self.last_lyric = 0.0, None
+        self.sends = []              # когда слали статус — для лимита Discord (5 за 20 с)
+        self.wake_at = None          # когда проснуться к следующей строке текста
         self.last_src = None
         self.sessions = []
         # вторая карточка — «Смотрит» (режим «обе карточки»)
@@ -1879,8 +1894,30 @@ class Worker(threading.Thread):
                 self.status("error", f"{e} — повтор через 5 с")
                 self.stop_ev.wait(5)
                 continue
-            self.stop_ev.wait(1.5)
+            self.nap()
         self.clear()
+
+    def nap(self):
+        """Пауза между проверками (до 1,5 с). Просыпаемся раньше, если MP3 Плеер
+        записал новую строку текста или подошло время следующей строки."""
+        end = time.monotonic() + 1.5
+        if self.wake_at:
+            end = min(end, self.wake_at)
+        try:
+            m0 = os.stat(MP3P_PATH).st_mtime_ns
+        except OSError:
+            m0 = None
+        while not self.stop_ev.is_set():
+            left = end - time.monotonic()
+            if left <= 0:
+                return
+            self.stop_ev.wait(min(0.1, left))
+            if m0 is not None:
+                try:
+                    if os.stat(MP3P_PATH).st_mtime_ns != m0:
+                        return
+                except OSError:
+                    return
 
     def hide_activity(self):
         if self.ipc and self.shown:
@@ -2028,13 +2065,24 @@ class Worker(threading.Thread):
             self.ipc = DiscordIPC(self.cfg["client_id"])
             self.ipc.connect()
 
-        lyric = None
+        lyric, next_in = None, None
         if self.cfg.get("lyrics", "off") != "off" and track["playing"] and track.get("has_lyrics"):
             lyric = track.get("lyric") or ""              # строка из .lrc рядом с треком (MP3 Плеер)
+            nxt, at = track.get("lyric_next"), track.get("lyric_next_at")
+            if nxt is not None and at is not None:
+                left = float(at) - track.get("ptime", track["time"])
+                if left <= LYRIC_LEAD:
+                    lyric = nxt                           # вот-вот начнётся — шлём заранее
+                else:
+                    next_in = left - LYRIC_LEAD
         elif self.cfg.get("lyrics", "off") != "off" and track["playing"] and track["length"] > 0:
             lines = self.lyrics.get(track)
             if lines:
-                lyric = current_line(lines, track["time"] + 0.8)
+                pos = track.get("ptime", track["time"]) + LYRIC_LEAD
+                lyric = current_line(lines, pos)
+                at = next_line_at(lines, pos)
+                if at is not None:
+                    next_in = at - pos
 
         file_cover = None
         if self.cfg.get("file_covers", True) and track.get("cover_file"):
@@ -2046,9 +2094,19 @@ class Worker(threading.Thread):
         start = int(time.time()) - track["time"]
         seeked = (track["length"] > 0 and self.last_start is not None
                   and abs(start - self.last_start) > 3)
-        lyric_due = lyric != self.last_lyric and now - self.last_set >= 4.2   # лимит Discord
+        n_max, window = DISCORD_BURST
+        self.sends = [t for t in self.sends if now - t < window]
+        budget = len(self.sends) < n_max and now - self.last_set >= 1.0
+        lyric_due = lyric != self.last_lyric and budget
+        self.wake_at = None
+        if lyric != self.last_lyric and not budget and self.sends:
+            # лимит исчерпан — проснуться ровно когда освободится место
+            self.wake_at = max(self.sends[0] + window, self.last_set + 1.0) + 0.05
+        elif next_in is not None:
+            self.wake_at = now + max(0.05, next_in)
         if key != self.last_key or seeked or lyric_due:
             self.ipc.set_activity(build_activity(track, self.cfg, lyric))
+            self.sends.append(now)
             self.shown, self.last_key, self.last_start = True, key, start
             self.last_src = track["src"]
             self.last_set, self.last_lyric = now, lyric
@@ -2885,8 +2943,8 @@ class App(tk.Tk):
             t = PToggle(lrow, text, self.cfg.get("lyrics", "off") == key, lambda k=key: self.set_lyrics(k))
             t.pack(side="left", padx=(0, 14))
             self.lyr_toggles[key] = t
-        tk.Label(box, text="Строчки с lrclib.net. Discord меняет статус не чаще раза в ~4 с, "
-                           "так что на быстрых песнях строки будут проскакивать.",
+        tk.Label(box, text="Строчки с lrclib.net. Discord пропускает до 5 смен статуса за 20 с, "
+                           "так что на очень быстрых песнях отдельные строки могут проскочить.",
                  bg=C["panel"], fg=C["muted"], font=(SANS, 8), wraplength=470,
                  justify="left").pack(anchor="w", pady=(2, 0))
 
