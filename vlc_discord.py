@@ -468,9 +468,21 @@ HIDDEN_SITES_DEFAULT = [
 ]
 
 
+_HIDDEN_NOW = list(HIDDEN_SITES_DEFAULT)      # текущий список — нужен и поиску вкладок
+
+
 def hidden_sites(cfg):
     v = cfg.get("hidden_sites")
     return HIDDEN_SITES_DEFAULT if v is None else v
+
+
+def _hidden_patterns(patterns):
+    return [p.strip().lower() for p in patterns if p.strip() and not p.strip().startswith("#")]
+
+
+def host_is_hidden(host, patterns):
+    host = (host or "").lower()
+    return bool(host) and any(p in host for p in _hidden_patterns(patterns))
 
 
 def is_hidden_site(track, cfg):
@@ -479,17 +491,25 @@ def is_hidden_site(track, cfg):
     Пока не понятно, с какого сайта видео, и включено «неизвестные не показывать» — тоже скрываем."""
     if not is_video(track):
         return False
+    pats = _hidden_patterns(hidden_sites(cfg))
+    _HIDDEN_NOW[:] = pats
     info = VIDEO_LINKS.get(track) or {}
     host = (urllib.parse.urlsplit(info.get("url") or "").hostname or "").lower()
     hay = " ".join([track.get("title", ""), track.get("artist", ""), track.get("album", "")]).lower()
-    for p in hidden_sites(cfg):
-        p = p.strip().lower()
-        if not p or p.startswith("#"):
-            continue
+    for p in pats:
         if (host and (p in host)) or p.replace(".com", "").replace(".xxx", "") in hay:
             return True
     if not info and cfg.get("hide_unknown_sites", True):
-        return True                       # ещё не знаем сайт — лучше подождать, чем показать лишнее
+        if not VIDEO_LINKS.missing(track):
+            return True                   # ещё ищем, с какого сайта, — пару секунд подождём
+        # сайт так и не определился (Rutube, аниме-сайты, Chrome без вкладок):
+        # показываем, если только в Firefox сейчас не открыт скрытый сайт
+        if track.get("app") == "Firefox":
+            try:
+                if any(host_is_hidden(urllib.parse.urlsplit(u).hostname, pats) for _, u in firefox_tabs()):
+                    return True
+            except Exception:
+                return True
     return False
 
 
@@ -1175,6 +1195,47 @@ def firefox_tabs():
     return tabs
 
 
+_WORD = re.compile(r"\w{2,}")
+# служебные слова в заголовках вкладок — по ним вкладки не сравниваем
+_TAB_STOP = {"смотреть", "онлайн", "online", "бесплатно", "серия", "серии", "сезон", "эпизод",
+             "episode", "season", "все", "аниме", "anime", "озвучка", "русской", "hd", "720", "1080",
+             "youtube", "rutube", "видео", "video", "watch", "full", "the", "and"}
+
+
+def _tab_words(s):
+    return {w for w in _WORD.findall(_norm_t(s)) if w not in _TAB_STOP}
+
+
+def video_site(host):
+    host = (host or "").lower()
+    return any(dom in host for dom, _ in SITE_NAMES)
+
+
+def match_tab(title, artist, tabs, hidden=()):
+    """Адрес вкладки, где, скорее всего, играет ролик. Сначала — заголовок целиком,
+    потом — по совпадению слов, и наконец единственная вкладка с видеосайтом."""
+    tabs = [(t, u) for t, u in tabs if u.startswith("http")]
+    wants = [w for w in (_norm_t(title), _norm_t(f"{artist} {title}"), _norm_t(f"{artist} - {title}")) if w]
+    for t, u in tabs:
+        nt = _norm_t(t)
+        if nt and any(w in nt or nt == w for w in wants):
+            return u
+    words = _tab_words(f"{artist} {title}")
+    if words:
+        best, url = 0.0, None
+        for t, u in tabs:
+            sc = len(words & _tab_words(t)) / len(words)
+            if sc > best:
+                best, url = sc, u
+        if best >= 0.6:
+            return url
+    hosts = [(urllib.parse.urlsplit(u).hostname or "") for _, u in tabs]
+    if any(host_is_hidden(h, hidden) for h in hosts):
+        return None                     # открыт скрытый сайт — не гадаем
+    vids = [u for (t, u), h in zip(tabs, hosts) if video_site(h)]
+    return vids[0] if len(vids) == 1 else None
+
+
 def youtube_search(title, channel=""):
     """ID первого подходящего видео в поиске YouTube или None."""
     q = urllib.parse.quote(f"{title} {channel}".strip())
@@ -1251,24 +1312,28 @@ class VideoLinks:
         threading.Thread(target=self._find, args=(key, track.get("app") or ""), daemon=True).start()
         return None
 
+    def missing(self, track):
+        """Искали — и сайт не нашли (не путать с «ещё ищем»)."""
+        key = (track.get("title") or "", track.get("artist") or "")
+        with self.lock:
+            hit = self.cache.get(key)
+        return hit is not None and not hit.get("url")
+
     def _find(self, key, app):
         title, channel = key
         info, err = {}, ""
         try:
             if app == "Firefox":
-                want = _norm_t(title)
-                for t, url in firefox_tabs():
-                    nt = _norm_t(t)
-                    if url.startswith("http") and want and (want in nt or nt == want):
-                        info = {"url": url, "src": "вкладка Firefox"}
-                        break
+                url = match_tab(title, channel, firefox_tabs(), _HIDDEN_NOW)
+                if url:
+                    info = {"url": url, "src": "вкладка Firefox"}
         except Exception as e:
             err = f"Firefox: {type(e).__name__}"
         vid = None
         if info.get("url"):
             m = _YT_ID.search(info["url"])
             vid = m.group(1) if m else None
-        if not info:
+        if not info and not (app == "Firefox" and info_tabs_hidden(_HIDDEN_NOW)):
             try:
                 vid = youtube_search(title, channel)
                 if vid:
@@ -1290,6 +1355,13 @@ class VideoLinks:
             self.busy.discard(key)
             if len(self.cache) > 300:
                 self.cache.clear()
+
+
+def info_tabs_hidden(hidden):
+    try:
+        return any(host_is_hidden(urllib.parse.urlsplit(u).hostname, hidden) for _, u in firefox_tabs())
+    except Exception:
+        return False
 
 
 VIDEO_LINKS = VideoLinks()
@@ -1504,13 +1576,24 @@ SITE_NAMES = [("youtube.com", "YouTube"), ("youtu.be", "YouTube"), ("twitch.tv",
               ("vkvideo.ru", "VK Видео"), ("vk.com", "VK Видео"), ("rutube.ru", "Rutube"),
               ("kick.com", "Kick"), ("netflix.com", "Netflix"), ("anilib", "AniLib"),
               ("animego", "AnimeGO"), ("kinopoisk.ru", "Кинопоиск"), ("ok.ru", "OK Видео"),
-              ("dzen.ru", "Дзен"), ("tiktok.com", "TikTok"), ("bilibili", "Bilibili")]
+              ("dzen.ru", "Дзен"), ("tiktok.com", "TikTok"), ("bilibili", "Bilibili"),
+              ("jut.su", "Jut.su"), ("anilibria", "AniLibria"), ("aniliberty", "AniLiberty"),
+              ("yummyanime", "YummyAnime"), ("yummy-anime", "YummyAnime"), ("animevost", "AnimeVost"),
+              ("animejoy", "AnimeJoy"), ("anidub", "AniDub"), ("sovetromantica", "SovetRomantica"),
+              ("animedia", "Animedia"), ("anime-bit", "Anime-Bit"), ("animestars", "AnimeStars"),
+              ("aniboom", "AniBoom"), ("kodik", "Kodik"), ("sibnet", "Sibnet"), ("rezka", "HDrezka"),
+              ("crunchyroll", "Crunchyroll"), ("shikimori", "Shikimori"), ("ivi.ru", "Иви"),
+              ("okko.tv", "Okko"), ("wink.ru", "Wink"), ("start.ru", "START"), ("plvideo", "Платформа")]
 
 
 def site_name(url):
     """«Смотрит YouTube» — название сайта по ссылке, иначе просто «видео»."""
     host = (urllib.parse.urlsplit(url or "").hostname or "").lower()
-    return next((n for dom, n in SITE_NAMES if dom in host), "видео")
+    name = next((n for dom, n in SITE_NAMES if dom in host), None)
+    if name:
+        return name
+    host = host.removeprefix("www.").removeprefix("m.")
+    return host if 3 <= len(host) <= 32 else "видео"       # незнакомый сайт — его адресом
 
 
 def as_watching(act, info):
@@ -3573,7 +3656,7 @@ class App(tk.Tk):
                                highlightcolor=C["blue"])
         self.hs_text.pack(fill="both", expand=True)
         self.hs_text.insert("1.0", "\n".join(hidden_sites(self.cfg)))
-        self.tg_unknown = PToggle(box, "Видео с неизвестного сайта не показывать (пока программа не поймёт, откуда оно)",
+        self.tg_unknown = PToggle(box, "Пока сайт не определился — не показывать (если не определится, покажу,\nно только когда в Firefox не открыт скрытый сайт)",
                                   self.cfg.get("hide_unknown_sites", True), self.save_hidden_sites)
         self.tg_unknown.pack(anchor="w", pady=(6, 0))
         row3 = tk.Frame(box, bg=C["panel"])
