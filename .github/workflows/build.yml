@@ -47,6 +47,10 @@ jobs:
         env:
           PYTHONIOENCODING: utf-8
         run: python tests/test_sites.py
+      - name: VPN card
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python tests/test_vpn_card.py
 
       - name: YouTube Music search (real requests)
         env:

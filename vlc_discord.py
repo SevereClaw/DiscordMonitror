@@ -77,6 +77,7 @@ DEFAULT_CFG = {
     "vpn_card": True,           # карточка «VPN» из NekoBoxP3R (страна, время, ссылка на репозиторий)
     "client_id_vpn": "",        # третье приложение Discord — для карточки VPN
     "vpn_show_server": True,    # показывать название сервера во второй строке
+    "vpn_stats": True,          # пинг и трафик за подключение (из NekoBoxP3R)
     "ignore_apps": [],
     "fallback_image": "logo",   # ключ картинки из Art Assets в Discord или https-ссылка
     "badge": "none",            # значок в углу обложки: none | logo | app
@@ -1681,29 +1682,63 @@ def read_neko_status():
     return st
 
 
+def human_size(n):
+    """1536 → «1,5 КБ» — объём трафика по-русски."""
+    n = float(n or 0)
+    for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
+        if n < 1024 or unit == "ТБ":
+            txt = f"{n:.0f}" if unit == "Б" or n >= 100 else f"{n:.1f}".rstrip("0").rstrip(".")
+            return txt.replace(".", ",") + " " + unit
+        n /= 1024
+    return ""
+
+
+def vpn_stats_line(st):
+    """«📶 85 мс · ↓ 1,2 ГБ ↑ 80 МБ» — пинг и трафик за это подключение (новый NekoBoxP3R)."""
+    parts = []
+    ping = st.get("ping")
+    if isinstance(ping, (int, float)) and ping > 0:
+        parts.append(f"📶 {int(ping)} мс")
+    elif isinstance(ping, (int, float)) and ping < 0:
+        parts.append("📶 нет ответа")
+    if "down" in st or "up" in st:
+        parts.append(f"↓ {human_size(st.get('down'))} ↑ {human_size(st.get('up'))}")
+    return " · ".join(parts)
+
+
 def build_vpn_activity(st, cfg):
     code = (st.get("country") or "").upper()
     cname = COUNTRY_RU.get(code, st.get("country_name") or code or "VPN")
     mode = VPN_MODES.get(st.get("mode"), "")
     repo = (st.get("repo") or NEKO_REPO)[:256]
-    second = " · ".join(x for x in ((st.get("server") if cfg.get("vpn_show_server", True) else ""), mode) if x)
+    server = st.get("server") if cfg.get("vpn_show_server", True) else ""
+    stats = vpn_stats_line(st) if cfg.get("vpn_stats", True) else ""
+    if stats:
+        details = f"🛡 {flag_emoji(code)} {cname}" + (f" · {server}" if server else "")
+        state = stats
+    else:                                   # старый NekoBoxP3R (без пинга и трафика) — как раньше
+        details = f"🛡 VPN · {flag_emoji(code)} {cname}"
+        state = " · ".join(x for x in (server, mode) if x) or "NekoBoxP3R"
+    flag = f"https://flagcdn.com/w160/{code.lower()}.png" if len(code) == 2 and code.isalpha() else None
     act = {
         "type": 0,
         "name": "NekoBoxP3R",
-        "details": fit(f"🛡 VPN · {flag_emoji(code)} {cname}"),
-        "state": fit(second or "NekoBoxP3R"),
+        "details": fit(details),
+        "state": fit(state),
         "details_url": repo,
         "state_url": repo,
         "assets": {
-            "large_image": f"https://flagcdn.com/w320/{code.lower()}.png" if len(code) == 2 else NEKO_LOGO,
-            "large_text": fit(cname),
+            # большая картинка — значок NekoBoxP3R, флаг страны — маленьким кружком в углу
+            "large_image": NEKO_LOGO,
+            "large_text": fit("NekoBoxP3R " + str(st.get("version") or "") + (f" · {mode}" if mode else "")),
             "large_url": repo,
-            "small_image": NEKO_LOGO,
-            "small_text": fit("NekoBoxP3R " + str(st.get("version") or "")),
         },
         "buttons": [{"label": "🛡 NekoBoxP3R на GitHub", "url": repo}],
         "instance": False,
     }
+    if flag:
+        act["assets"]["small_image"] = flag
+        act["assets"]["small_text"] = fit(cname)
     since = int(st.get("since") or 0)
     if since > 0:
         act["timestamps"] = {"start": since * 1000}       # Discord сам считает «прошло 00:42:13»
@@ -2266,7 +2301,8 @@ class Worker(threading.Thread):
                 self.nipc.connect()
                 self.n_pid, self.n_key = pid, None
             key = (st.get("country"), st.get("server"), st.get("mode"), st.get("since"),
-                   self.cfg.get("vpn_show_server", True))
+                   self.cfg.get("vpn_show_server", True), self.cfg.get("vpn_stats", True),
+                   vpn_stats_line(st))
             if key != self.n_key:
                 self.nipc.set_activity(build_vpn_activity(st, self.cfg))
                 self.n_key, self.n_shown = key, True
@@ -3483,6 +3519,9 @@ class App(tk.Tk):
         self.tg_vpn_srv = PToggle(box, "Показывать название сервера",
                                   self.cfg.get("vpn_show_server", True), self.save_vpn_opts)
         self.tg_vpn_srv.pack(fill="x", pady=2)
+        self.tg_vpn_stats = PToggle(box, "Показывать пинг и сколько данных прошло (NekoBoxP3R 0.20.3+)",
+                                    self.cfg.get("vpn_stats", True), self.save_vpn_opts)
+        self.tg_vpn_stats.pack(fill="x", pady=2)
         nrow = tk.Frame(box, bg=C["panel"])
         nrow.pack(fill="x", pady=(4, 0))
         tk.Label(nrow, text="ID приложения для VPN", bg=C["panel"], fg=C["cream"],
@@ -3573,6 +3612,7 @@ class App(tk.Tk):
     def save_vpn_opts(self):
         self.cfg["vpn_card"] = self.tg_vpn.value
         self.cfg["vpn_show_server"] = self.tg_vpn_srv.value
+        self.cfg["vpn_stats"] = self.tg_vpn_stats.value
         if self.tg_vpn.value and not (self.cfg.get("client_id_vpn") or "").strip():
             self.show_window()
             self.help_vpn_id()
