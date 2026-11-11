@@ -43,7 +43,9 @@ jobs:
         env:
           PYTHONIOENCODING: utf-8
         run: python tests/test_video_links.py
-      - name: Тест определения сайтов
+      - name: Video site detection
+        env:
+          PYTHONIOENCODING: utf-8
         run: python tests/test_sites.py
 
       - name: YouTube Music search (real requests)
