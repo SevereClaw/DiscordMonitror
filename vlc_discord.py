@@ -1648,6 +1648,7 @@ def build_video_activity(track, cfg, thumb=None):
 NEKO_STATUS = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "NekoBoxP3R", "status.json")
 NEKO_REPO = "https://github.com/SevereClaw/NekoBoxP3R"
 NEKO_LOGO = "https://raw.githubusercontent.com/SevereClaw/NekoBoxP3R/main/res/public/nekobox.png"
+NEKO_CARD = "https://raw.githubusercontent.com/SevereClaw/DiscordMonitror/main/assets/vpn_card.jpg"   # окно NekoBoxP3R
 COUNTRY_RU = {
     "DE": "Германия", "NL": "Нидерланды", "FI": "Финляндия", "SE": "Швеция", "NO": "Норвегия", "DK": "Дания",
     "FR": "Франция", "IT": "Италия", "ES": "Испания", "PT": "Португалия", "GB": "Великобритания", "IE": "Ирландия",
@@ -1729,7 +1730,7 @@ def build_vpn_activity(st, cfg):
         "state_url": repo,
         "assets": {
             # большая картинка — значок NekoBoxP3R, флаг страны — маленьким кружком в углу
-            "large_image": NEKO_LOGO,
+            "large_image": NEKO_CARD,
             "large_text": fit("NekoBoxP3R " + str(st.get("version") or "") + (f" · {mode}" if mode else "")),
             "large_url": repo,
         },
