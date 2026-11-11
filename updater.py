@@ -6,6 +6,7 @@
 новый файл и запускает маленький скрипт PowerShell: он ждёт, пока программа
 закроется, кладёт новые файлы на место старых и запускает её снова.
 Запуск из исходников (python …py) — BUILD = 0, обновления выключены."""
+import html
 import json
 import os
 import re
@@ -13,6 +14,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -31,8 +34,82 @@ def can_update():
     return sys.platform == "win32" and getattr(sys, "frozen", False) and current_build() > 0
 
 
+# api.github.com без входа даёт всего 60 запросов в час на IP — а через VPN или у
+# мобильного оператора один IP делят тысячи людей, и лимит кончается («rate limit
+# exceeded»). Поэтому номер последней сборки берём из обычной страницы github.com
+# (переадресация …/releases/latest → …/releases/tag/build-N), описания — из ленты
+# releases.atom, а файл — по прямой ссылке. API — только запасной путь.
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def latest_tag(repo, timeout=10):
+    """Тег последнего релиза (например «build-28») по переадресации github.com."""
+    req = urllib.request.Request(f"https://github.com/{repo}/releases/latest",
+                                 headers={"User-Agent": UA}, method="HEAD")
+    try:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout) as r:
+            loc = r.geturl()
+    except urllib.error.HTTPError as e:
+        if e.code not in (301, 302, 303, 307, 308):
+            raise
+        loc = e.headers.get("Location") or ""
+    m = re.search(r"/releases/tag/([^/?#]+)", loc)
+    return urllib.parse.unquote(m.group(1)) if m else None
+
+
+def _html_text(h):
+    """HTML описания релиза → текст с пунктами «• …»."""
+    h = re.sub(r"(?i)<li[^>]*>", "\n- ", h)
+    h = re.sub(r"(?i)<br\s*/?>|</p>|</li>|</h\d>", "\n", h)
+    h = re.sub(r"<[^>]+>", "", h)
+    return html.unescape(h)
+
+
+def feed(repo, timeout=10):
+    """Релизы из ленты releases.atom: [(тег, название, текст)] — от новых к старым."""
+    req = urllib.request.Request(f"https://github.com/{repo}/releases.atom", headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        xml = r.read().decode("utf-8", "replace")
+    out = []
+    for ent in re.findall(r"<entry>(.*?)</entry>", xml, re.S):
+        m = re.search(r"/releases/tag/([^\"/?#]+)", ent)
+        if not m:
+            continue
+        title = re.search(r"<title[^>]*>(.*?)</title>", ent, re.S)
+        content = re.search(r"<content[^>]*>(.*?)</content>", ent, re.S)
+        body = _html_text(html.unescape(content.group(1))) if content else ""
+        out.append((urllib.parse.unquote(m.group(1)), html.unescape(title.group(1)).strip() if title else "", body))
+    return out
+
+
+def _build_of(tag):
+    m = re.search(r"(\d+)\s*$", tag or "")
+    return int(m.group(1)) if m else None
+
+
 def latest(repo, asset_name, timeout=10):
     """Последний релиз: {'build', 'url', 'size', 'title', 'notes'} или None."""
+    try:
+        tag = latest_tag(repo, timeout)
+    except Exception:
+        tag = None
+    if tag and _build_of(tag) is not None:
+        title, notes = tag, ""
+        try:
+            for t, ti, body in feed(repo, timeout):
+                if t == tag:
+                    title, notes = ti or tag, body.strip()
+                    break
+        except Exception:
+            pass                                  # без описания — не беда
+        return {"build": _build_of(tag), "size": 0, "title": title, "notes": notes,
+                "url": f"https://github.com/{repo}/releases/download/{urllib.parse.quote(tag)}/{asset_name}"}
+    return latest_api(repo, asset_name, timeout)
+
+
+def latest_api(repo, asset_name, timeout=10):
     req = urllib.request.Request(f"https://api.github.com/repos/{repo}/releases/latest",
                                  headers={"User-Agent": UA, "Accept": "application/vnd.github+json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -48,6 +125,17 @@ def latest(repo, asset_name, timeout=10):
 
 def notes_since(repo, after_build, upto_build=None, limit=15, timeout=10):
     """Описания сборок новее after_build: [(номер, текст), …] — от новой к старой."""
+    try:
+        out = []
+        for tag, _title, body in feed(repo, timeout):
+            b = _build_of(tag)
+            if b is not None and b > after_build and (upto_build is None or b <= upto_build):
+                out.append((b, clean_notes(body)))
+        if out:
+            out.sort(reverse=True)
+            return out[:limit]
+    except Exception:
+        pass
     req = urllib.request.Request(f"https://api.github.com/repos/{repo}/releases?per_page=30",
                                  headers={"User-Agent": UA, "Accept": "application/vnd.github+json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -62,6 +150,16 @@ def notes_since(repo, after_build, upto_build=None, limit=15, timeout=10):
             out.append((b, clean_notes(rel.get("body") or "")))
     out.sort(reverse=True)
     return out[:limit]
+
+
+def friendly_error(e):
+    """Понятный текст ошибки проверки обновлений."""
+    code = getattr(e, "code", None)
+    if code in (403, 429):
+        return "GitHub временно ограничил проверки с твоего адреса (часто бывает через VPN). Попробую позже сам."
+    if isinstance(e, (urllib.error.URLError, TimeoutError, OSError)) and not code:
+        return "нет связи с GitHub — проверю позже"
+    return str(e)
 
 
 def clean_notes(body):
@@ -93,9 +191,9 @@ def download(url, dest, size=0, progress=None):
             got += len(chunk)
             if progress and total:
                 progress(min(100.0, got * 100.0 / total))
-    if size and got != size:
+    if (size and got != size) or (total and got != total):
         os.remove(tmp)
-        raise IOError(f"скачалось {got} из {size} байт")
+        raise IOError(f"скачалось {got} из {size or total} байт")
     os.replace(tmp, dest)
     return dest
 

@@ -4130,7 +4130,7 @@ class App(tk.Tk):
         except Exception as e:
             self.update_state = ""
             if manual:
-                q.put({"cmd": "update_msg", "text": f"Не удалось проверить обновление: {e}"})
+                q.put({"cmd": "update_msg", "text": f"Не удалось проверить обновление: {updater.friendly_error(e)}"})
 
     def install_update(self, path, build):
         save_cfg(self.cfg)
