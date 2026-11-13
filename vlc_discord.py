@@ -734,27 +734,125 @@ def custom_cover(cfg, track):
     return None, None
 
 
+PORTAL_URL = "https://discord.com/developers/applications"
+GUIDE_URL = f"https://github.com/{UPDATE_REPO}#как-подключить-к-discord"
+
+
+def parse_app_id(text):
+    """Что бы ни вставили в поле Application ID → (id, "") или ("", что не так).
+    Понимает ID с пробелами и ссылку на страницу приложения; узнаёт Public Key,
+    токен бота и Client Secret, которые чаще всего копируют по ошибке."""
+    s = (text or "").strip().strip("\"'`«»")
+    if not s:
+        return "", "Поле пустое. Скопируй Application ID кнопкой Copy на странице приложения."
+    m = re.search(r"/applications/(\d{17,20})(?!\d)", s)
+    if m:
+        return m.group(1), ""
+    digits = re.sub(r"[\s\u200b\u00a0]", "", s)
+    if digits.isdigit():
+        if 17 <= len(digits) <= 20:
+            return digits, ""
+        return "", (f"Здесь {len(digits)} цифр, а в Application ID их 17–20. "
+                    "Скопируй его кнопкой Copy — так ничего не потеряется.")
+    if re.fullmatch(r"[0-9a-fA-F]{64}", s):
+        return "", ("Это Public Key (длинная строка из букв и цифр). Нужна строчка выше — "
+                    "APPLICATION ID, в ней только цифры.")
+    if len(s) > 50 and s.count(".") == 2:
+        return "", ("Это токен бота — он здесь не нужен (и никому его не показывай). "
+                    "Нужен APPLICATION ID со страницы General Information: только цифры.")
+    if re.fullmatch(r"[A-Za-z0-9_\-]{32}", s):
+        return "", ("Это похоже на Client Secret. Нужен APPLICATION ID со страницы "
+                    "General Information: только цифры.")
+    return "", "Application ID — это только цифры (17–20 штук). Скопируй его кнопкой Copy."
+
+
+def discord_running():
+    """Запущена ли программа Discord (обычная, PTB или Canary). None — узнать не удалось."""
+    if os.name != "nt":
+        return None
+    try:
+        W = ctypes.wintypes
+
+        class PE(ctypes.Structure):
+            _fields_ = [("dwSize", W.DWORD), ("cntUsage", W.DWORD), ("th32ProcessID", W.DWORD),
+                        ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", W.DWORD),
+                        ("cntThreads", W.DWORD), ("th32ParentProcessID", W.DWORD),
+                        ("pcPriClassBase", ctypes.c_long), ("dwFlags", W.DWORD),
+                        ("szExeFile", ctypes.c_wchar * 260)]
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateToolhelp32Snapshot.restype = W.HANDLE
+        k32.CreateToolhelp32Snapshot.argtypes = [W.DWORD, W.DWORD]
+        k32.Process32FirstW.argtypes = [W.HANDLE, ctypes.POINTER(PE)]
+        k32.Process32NextW.argtypes = [W.HANDLE, ctypes.POINTER(PE)]
+        k32.CloseHandle.argtypes = [W.HANDLE]
+        snap = k32.CreateToolhelp32Snapshot(2, 0)            # TH32CS_SNAPPROCESS
+        if not snap or snap == W.HANDLE(-1).value:
+            return None
+        try:
+            pe = PE()
+            pe.dwSize = ctypes.sizeof(PE)
+            ok = k32.Process32FirstW(snap, ctypes.byref(pe))
+            while ok:
+                if pe.szExeFile.lower() in ("discord.exe", "discordptb.exe", "discordcanary.exe",
+                                            "discorddevelopment.exe"):
+                    return True
+                ok = k32.Process32NextW(snap, ctypes.byref(pe))
+            return False
+        finally:
+            k32.CloseHandle(snap)
+    except Exception:
+        return None
+
+
+class DiscordError(ConnectionError):
+    """Не подключились к Discord. kind — причина, по ней мастер подключения даёт совет:
+    no_discord | starting | admin | bad_id | rejected."""
+    def __init__(self, kind, text):
+        super().__init__(text)
+        self.kind = kind
+
+
 class DiscordIPC:
     def __init__(self, client_id, pid=None):
         self.client_id = client_id
         self.pid = pid or os.getpid()      # у второй карточки — другой (живой) процесс
         self.pipe = None
+        self.user = ""                     # под каким аккаунтом открыт Discord (после connect)
 
     def connect(self):
+        denied = False
         for i in range(10):
             try:
                 self.pipe = open(rf"\\.\pipe\discord-ipc-{i}", "r+b", buffering=0)
                 break
+            except PermissionError:
+                denied = True
             except OSError:
                 continue
         else:
-            raise ConnectionError("Discord не запущен")
+            if denied:
+                raise DiscordError("admin", "Discord запущен от имени администратора, а Music → Discord — "
+                                            "нет. Закрой Discord (значок в трее → выход) и открой обычным "
+                                            "способом")
+            if discord_running():
+                raise DiscordError("starting", "Discord ещё загружается. Если он давно открыт — закрой его "
+                                               "совсем (значок в трее → выход) и открой заново")
+            raise DiscordError("no_discord", "Discord не запущен. Нужна программа Discord на этом "
+                                             "компьютере — версия в браузере не подходит")
         self._send(0, {"v": 1, "client_id": self.client_id})
         op, data = self._recv()
         if data.get("evt") == "ERROR" or op == 2:
             self.close()
-            raise ConnectionError(data.get("data", {}).get("message") or data.get("message")
-                                  or "Discord отклонил подключение")
+            inner = data.get("data") if isinstance(data.get("data"), dict) else {}
+            msg = inner.get("message") or data.get("message") or ""
+            code = inner.get("code") or data.get("code")
+            if code == 4000 or "client id" in msg.lower():
+                raise DiscordError("bad_id", "Discord не знает такой Application ID. Скопируй его заново "
+                                             "кнопкой Copy на странице приложения (не Public Key и не "
+                                             "свой ID пользователя)")
+            raise DiscordError("rejected", "Discord отклонил подключение" + (f": {msg}" if msg else ""))
+        user = (data.get("data") or {}).get("user") or {}
+        self.user = user.get("global_name") or user.get("username") or ""
 
     def _send(self, op, obj):
         payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -2553,6 +2651,228 @@ def plural(n, one, few, many):
     return many
 
 
+class SetupWizard(tk.Toplevel):
+    """Подключение к Discord по шагам: открыть сайт → скопировать Application ID
+    (ловим его из буфера обмена сами) → проверить связь и сказать по-русски, что не так."""
+
+    ADVICE = {
+        "no_discord": "Открой программу Discord, дождись, пока она загрузится, и нажми «Проверить» ещё раз. "
+                      "Discord в браузере не подходит — нужна программа с discord.com/download.",
+        "starting": "Подожди полминуты и нажми «Проверить» ещё раз. Не помогло — закрой Discord совсем: "
+                    "значок возле часов → правый клик → «Quit Discord», и открой заново.",
+        "admin": "Discord запущен «от имени администратора», поэтому обычные программы до него не достают. "
+                 "Закрой его совсем (значок возле часов → правый клик → «Quit Discord») и открой обычным "
+                 "двойным кликом. У ярлыка Discord не должно стоять «Запускать от имени администратора».",
+        "bad_id": "Вернись на сайт (кнопка в шаге 1), открой своё приложение и нажми Copy под надписью "
+                  "APPLICATION ID. Не подходят: Public Key, Client Secret, токен бота и твой собственный "
+                  "ID пользователя из Discord.",
+        "rejected": "Перезапусти Discord и нажми «Проверить» ещё раз.",
+    }
+
+    def __init__(self, app, note=""):
+        super().__init__(app)
+        self.app, self.alive, self.busy, self.done = app, True, False, False
+        self.results = queue.Queue()
+        self.title("Подключение к Discord")
+        self.configure(bg=C["bg"])
+        self.resizable(False, False)
+        self.transient(app)
+        try:
+            self.iconbitmap(resource("icon.ico"))
+        except Exception:
+            pass
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        outer, box = frame_box(self, "Подключение к Discord — один раз, 2 минуты")
+        outer.pack(fill="both", expand=True, padx=14, pady=14)
+        W = 440
+
+        def text(msg, fg=C["cream"], pady=(0, 0), font=(SANS, 9)):
+            lbl = tk.Label(box, text=msg, bg=C["panel"], fg=fg, font=font, wraplength=W,
+                           justify="left", anchor="w")
+            lbl.pack(fill="x", pady=pady)
+            return lbl
+
+        def head(msg):
+            tk.Frame(box, bg=C["line"], height=1).pack(fill="x", pady=(10, 8))
+            text(msg, C["gold"], font=(SERIF, 10, "bold"))
+
+        text("Discord показывает статус только от имени «приложения». Его надо один раз создать "
+             "на сайте Discord — это бесплатно, и ничего программировать не нужно. "
+             "Сам Discord при этом должен быть открыт на этом компьютере (программа, не браузер).",
+             C["muted"])
+
+        head("ШАГ 1 · СОЗДАЙ ПРИЛОЖЕНИЕ")
+        PButton(box, "🌐  Открыть сайт Discord для разработчиков", self.open_portal).pack(fill="x", pady=(4, 6))
+        text("•  Войди в свой аккаунт Discord, если сайт попросит.\n"
+             "•  Справа вверху нажми синюю кнопку New Application.\n"
+             "•  Впиши название — его увидят друзья: «Слушает <название>». Например: Музыка.\n"
+             "•  Поставь галочку под названием и нажми Create.\n"
+             "Сайт не открывается? Включи VPN — Discord без него может не работать.")
+
+        head("ШАГ 2 · СКОПИРУЙ APPLICATION ID")
+        text("После Create откроется страница General Information. Найди на ней надпись "
+             "APPLICATION ID (длинное число) и нажми под ней кнопку Copy. "
+             "Я сам замечу скопированное и вставлю сюда:")
+        row = tk.Frame(box, bg=C["panel"])
+        row.pack(fill="x", pady=(6, 0))
+        self.id_var = tk.StringVar(value=(app.id_var.get() or "").strip())
+        self.id_entry = app.entry(row, self.id_var, 26)
+        self.id_entry.pack(side="left", fill="x", expand=True, ipady=4, padx=(0, 6))
+        PButton(row, "Вставить", self.paste).pack(side="left")
+        self.id_hint = text("", C["muted"], pady=(4, 0))
+        self.id_var.trace_add("write", lambda *_: self.show_id_hint())
+
+        head("ШАГ 3 · ПРОВЕРКА")
+        self.check_btn = PButton(box, "✔  Проверить и подключить", self.check, accent=True)
+        self.check_btn.pack(fill="x", pady=(4, 6))
+        self.result = text("", C["muted"])
+
+        tk.Frame(box, bg=C["line"], height=1).pack(fill="x", pady=(10, 8))
+        row = tk.Frame(box, bg=C["panel"])
+        row.pack(fill="x")
+        link = tk.Label(row, text="Подробная инструкция с разбором ошибок", bg=C["panel"], fg=C["blue"],
+                        font=(SANS, 9, "underline"), cursor="hand2")
+        link.pack(side="left")
+        link.bind("<Button-1>", lambda e: webbrowser.open(GUIDE_URL))
+        self.close_btn = PButton(row, "Закрыть", self.close)
+        self.close_btn.pack(side="right")
+
+        self.seen_clip = self.read_clip()
+        if not self.id_var.get().strip() and len(self.seen_clip) < 200:
+            cid = parse_app_id(self.seen_clip)[0]          # ID уже скопирован до открытия окна
+            if cid:
+                self.id_var.set(cid)
+        self.show_id_hint()
+        if note:
+            self.id_hint.config(text="✗  " + note, fg="#ff8a8a")
+        try:
+            self.update_idletasks()
+            x = app.winfo_rootx() + (app.winfo_width() - self.winfo_reqwidth()) // 2
+            y = min(app.winfo_rooty() + 30, self.winfo_screenheight() - self.winfo_reqheight() - 160)
+            self.geometry(f"+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            pass
+        self.after(400, self.tick)
+
+    # ── буфер обмена ──
+    def read_clip(self):
+        try:
+            return self.clipboard_get()
+        except Exception:
+            return ""
+
+    def come_forward(self):
+        try:
+            self.deiconify()
+            self.lift()
+            self.attributes("-topmost", True)
+            self.after(1500, lambda: self.alive and self.attributes("-topmost", False))
+            self.focus_force()
+        except Exception:
+            pass
+
+    def paste(self):
+        clip = self.read_clip().strip()
+        if not clip:
+            self.id_hint.config(text="✗  В буфере обмена пусто. Нажми Copy под APPLICATION ID на сайте.",
+                                fg="#ff8a8a")
+            return
+        cid, why = parse_app_id(clip)
+        self.id_var.set(cid or clip[:80])
+        if not cid:
+            self.id_hint.config(text="✗  " + why, fg="#ff8a8a")
+
+    def show_id_hint(self):
+        raw = self.id_var.get()
+        if not raw.strip():
+            self.id_hint.config(text="Жду Application ID…", fg=C["muted"])
+            return
+        cid, why = parse_app_id(raw)
+        if cid:
+            self.id_hint.config(text="✓  Похоже на Application ID. Теперь шаг 3.", fg="#8fe3a2")
+        else:
+            self.id_hint.config(text="✗  " + why, fg="#ff8a8a")
+
+    def tick(self):
+        if not self.alive:
+            return
+        try:
+            while True:
+                self.on_result(*self.results.get_nowait())
+        except queue.Empty:
+            pass
+        if not self.done and not self.busy:
+            clip = self.read_clip()
+            if clip != self.seen_clip:
+                self.seen_clip = clip
+                cid, _ = parse_app_id(clip) if len(clip) < 200 else ("", "")
+                if cid and cid != parse_app_id(self.id_var.get())[0]:
+                    self.id_var.set(cid)
+                    self.id_hint.config(text="✓  Поймал Application ID из буфера обмена. Теперь шаг 3.",
+                                        fg="#8fe3a2")
+                    self.come_forward()
+        self.after(400, self.tick)
+
+    # ── действия ──
+    def open_portal(self):
+        webbrowser.open(PORTAL_URL)
+
+    def check(self):
+        if self.done:
+            self.close()
+            return
+        if self.busy:
+            return
+        cid, why = parse_app_id(self.id_var.get())
+        if not cid:
+            self.id_hint.config(text="✗  " + (why if self.id_var.get().strip() else
+                                              "Сначала шаг 2: нужен Application ID."), fg="#ff8a8a")
+            return
+        self.id_var.set(cid)
+        self.busy = True
+        self.result.config(text="Стучусь в Discord…", fg=C["muted"])
+        results = self.results
+
+        def work():
+            ipc = DiscordIPC(cid)
+            try:
+                ipc.connect()
+                results.put((cid, None, ipc.user))
+            except Exception as e:
+                results.put((cid, e, ""))
+            finally:
+                ipc.close()
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_result(self, cid, err, user):
+        self.busy = False
+        if err is not None:
+            kind = getattr(err, "kind", "")
+            advice = self.ADVICE.get(kind, "Перезапусти Discord и нажми «Проверить» ещё раз.")
+            self.result.config(text=f"✗  {err}.\n\nЧто делать: {advice}", fg="#ff8a8a")
+            self.come_forward()
+            return
+        self.done = True
+        self.app.connect_with(cid)
+        who = f" (аккаунт {user})" if user else ""
+        self.result.config(
+            text=f"✓  Готово! Discord принял подключение{who}.\n"
+                 "Включи музыку — секунд через 10 она появится у тебя в профиле Discord "
+                 "(нажми на свою аватарку слева внизу).\n"
+                 "Не появилась? В Discord: Настройки → «Конфиденциальность активности» → включи показ "
+                 "своей активности другим. И статус не должен быть «Невидимый».",
+            fg="#8fe3a2")
+        self.check_btn.config(text="Готово — закрыть")
+        self.check_btn.set_accent(False)
+        self.come_forward()
+
+    def close(self):
+        self.alive = False
+        if getattr(self.app, "setup_win", None) is self:
+            self.app.setup_win = None
+        self.destroy()
+
+
 class LastFMDialog(tk.Toplevel):
     def __init__(self, app):
         super().__init__(app)
@@ -2911,8 +3231,10 @@ class App(tk.Tk):
         if self.cfg["client_id"]:
             self.toggle()
         else:
-            self.set_state("off", "Вставь Application ID на вкладке «Главное» и нажми «Начать».")
+            self.set_state("off", "Не подключено к Discord. Нажми «Подключить по шагам» — это 2 минуты.")
             self.show_tab("main")
+            if "--minimized" not in sys.argv:
+                self.after(700, self.open_setup)
         if "--minimized" in sys.argv:
             if self.tray:
                 self.withdraw()
@@ -3038,7 +3360,7 @@ class App(tk.Tk):
         tk.Label(row, text="Application ID", bg=C["panel"], fg=C["cream"], font=(SANS, 10)).pack(side="left")
         self.id_var = tk.StringVar(value=self.cfg["client_id"])
         self.entry(row, self.id_var).pack(side="left", padx=8, ipady=3, fill="x", expand=True)
-        PButton(row, "?", self.help_id).pack(side="left")
+        PButton(row, "Подключить по шагам", self.open_setup).pack(side="left")
 
         tk.Frame(box, bg=C["line"], height=1).pack(fill="x", pady=10)
         self.tg_fcover = PToggle(box, "Обложка из самого файла (MP3 Плеер, VLC)",
@@ -3595,9 +3917,12 @@ class App(tk.Tk):
 
     def save_video_id(self):
         vid = self.vid_var.get().strip()
-        if vid and not vid.isdigit():
-            messagebox.showwarning(APP_NAME, "Application ID — это только цифры.")
-            return
+        if vid:
+            vid, why = parse_app_id(vid)
+            if not vid:
+                messagebox.showwarning(APP_NAME, why)
+                return
+            self.vid_var.set(vid)
         if vid and vid == self.cfg.get("client_id", ""):
             messagebox.showwarning(APP_NAME, "Нужен ДРУГОЙ ID, не тот, что для музыки: "
                                              "Discord показывает одну карточку на приложение.")
@@ -3622,9 +3947,12 @@ class App(tk.Tk):
 
     def save_vpn_id(self):
         vid = self.vpn_var.get().strip()
-        if vid and not vid.isdigit():
-            messagebox.showwarning(APP_NAME, "Application ID — это только цифры.")
-            return
+        if vid:
+            vid, why = parse_app_id(vid)
+            if not vid:
+                messagebox.showwarning(APP_NAME, why)
+                return
+            self.vpn_var.set(vid)
         if vid and vid in (self.cfg.get("client_id", ""), self.cfg.get("client_id_video", "")):
             messagebox.showwarning(APP_NAME, "Нужен ДРУГОЙ ID, не тот, что для музыки или видео: "
                                              "Discord показывает одну карточку на приложение.")
@@ -3718,12 +4046,23 @@ class App(tk.Tk):
         self.save_hidden_sites()
 
     # ── действия ──
-    def help_id(self):
-        messagebox.showinfo("Как получить Application ID",
-            "1. Открой discord.com/developers/applications\n"
-            "2. New Application → назови, например, «Музыка»\n"
-            "3. Скопируй Application ID и вставь сюда.\n\n"
-            "Это одноразово, больше там ничего делать не нужно.")
+    def open_setup(self, note=""):
+        """Мастер подключения к Discord (одно окно на программу)."""
+        win = getattr(self, "setup_win", None)
+        if win is not None and win.alive:
+            win.come_forward()
+            return win
+        if self.state() in ("withdrawn", "iconic"):
+            self.show_window()
+        self.setup_win = SetupWizard(self, note)
+        return self.setup_win
+
+    def connect_with(self, cid):
+        """Мастер проверил ID — запомнить и (пере)запустить показ статуса."""
+        self.id_var.set(cid)
+        if self.worker:
+            self.toggle()                 # остановить со старым ID
+        self.toggle()
 
     def push_cfg(self):
         save_cfg(self.cfg)
@@ -3926,11 +4265,12 @@ class App(tk.Tk):
             if self.tray:
                 self.tray.set_title(APP_NAME)
             return
-        cid = self.id_var.get().strip()
-        if not cid.isdigit():
+        cid, why = parse_app_id(self.id_var.get())
+        if not cid:
             self.show_tab("main")
-            messagebox.showwarning(APP_NAME, "Application ID — это длинное число. Нажми «?».")
+            self.open_setup(why if self.id_var.get().strip() else "")
             return
+        self.id_var.set(cid)
         self.cfg["client_id"] = cid
         self.save_blacklist(silent=True)
         self.worker = Worker(self.cfg, self.q, self.history, self.lastfm)

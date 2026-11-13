@@ -56,6 +56,10 @@ jobs:
         env:
           PYTHONIOENCODING: utf-8
         run: python tests/test_vpn_card.py
+      - name: Connecting to Discord (ID parsing, errors, step-by-step wizard with a fake Discord)
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python tests/test_setup.py
 
       - name: YouTube Music search (real requests)
         env:
