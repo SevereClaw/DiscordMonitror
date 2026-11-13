@@ -60,6 +60,10 @@ jobs:
         env:
           PYTHONIOENCODING: utf-8
         run: python tests/test_setup.py
+      - name: Window scrolling (small window, every tab)
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python tests/test_scroll.py
 
       - name: YouTube Music search (real requests)
         env:

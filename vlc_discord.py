@@ -3204,8 +3204,14 @@ class App(tk.Tk):
         self.build = updater.current_build()
         self.update_state = ""            # "", "checking", "downloading 42%", "ready N", "latest"
         self.title(APP_NAME + (f" · сборка {self.build}" if self.build else ""))
-        self.geometry("540x790")
-        self.minsize(540, 790)
+        # окно можно сделать ниже — содержимое тогда прокручивается колёсиком
+        try:
+            want = int(self.cfg.get("window_h") or 790)
+        except (TypeError, ValueError):
+            want = 790
+        h = max(self.MIN_H, min(want, self.winfo_screenheight() - 90))
+        self.geometry(f"540x{h}")
+        self.minsize(540, self.MIN_H)
         try:
             self.iconbitmap(resource("icon.ico"))
         except Exception:
@@ -3213,6 +3219,7 @@ class App(tk.Tk):
         self.configure(bg=C["bg"])
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
+        self.build_scroll()
         self.build_header()
         self.build_now_playing()
         self.build_tabs()
@@ -3245,9 +3252,100 @@ class App(tk.Tk):
         if self.autostart_note:
             self.after(3000, lambda: self.status_lbl.config(text=self.autostart_note))
 
+    # ── прокрутка всего окна ──
+    MIN_H = 380
+    BAR_W = 8
+
+    def build_scroll(self):
+        """Всё содержимое лежит в self.body внутри холста: если окно ниже содержимого,
+        оно крутится колёсиком, а справа появляется тонкая полоса."""
+        self.sbar = tk.Canvas(self, width=self.BAR_W, bg=C["bg"], highlightthickness=0, cursor="hand2")
+        self.scroll_cv = tk.Canvas(self, bg=C["bg"], highlightthickness=0, yscrollincrement=20)
+        self.scroll_cv.pack(side="left", fill="both", expand=True)
+        self.body = tk.Frame(self.scroll_cv, bg=C["bg"])
+        self.body_win = self.scroll_cv.create_window(0, 0, window=self.body, anchor="nw")
+        self.body_need, self.wheel_acc, self.bar_shown, self.drag_from = 0, 0.0, False, None
+        self.scroll_cv.bind("<Configure>", lambda e: self.layout_scroll())
+        self.sbar.bind("<Button-1>", self.bar_press)
+        self.sbar.bind("<B1-Motion>", self.bar_drag)
+        self.sbar.bind("<Configure>", lambda e: self.draw_bar())
+        self.bind_all("<MouseWheel>", self.on_wheel)
+        for key, pages in (("<Prior>", -1), ("<Next>", 1)):
+            self.bind(key, lambda e, n=pages: self.scroll_pages(e, n))
+
+    def layout_scroll(self):
+        cv = self.scroll_cv
+        w, view = cv.winfo_width(), cv.winfo_height()
+        if w < 2 or view < 2:
+            return
+        need = self.body.winfo_reqheight()
+        self.body_need = need
+        h = max(need, view)                        # высокое окно — вкладка растягивается, как раньше
+        cv.itemconfigure(self.body_win, width=w, height=h)
+        cv.configure(scrollregion=(0, 0, w, h))
+        show = need > view + 1
+        if show != self.bar_shown:
+            self.bar_shown = show
+            if show:
+                self.sbar.pack(side="right", fill="y", before=cv)
+            else:
+                self.sbar.pack_forget()
+                cv.yview_moveto(0)
+        self.draw_bar()
+
+    def draw_bar(self):
+        if not self.bar_shown:
+            return
+        a, b = self.scroll_cv.yview()
+        h = self.sbar.winfo_height()
+        self.sbar.delete("all")
+        y0, y1 = a * h, max(b * h, a * h + 24)
+        self.sbar.create_rectangle(2, y0 + 2, self.BAR_W - 1, y1 - 2, fill=C["line"], outline="")
+
+    def scroll_by(self, units):
+        if self.bar_shown and units:
+            self.scroll_cv.yview_scroll(units, "units")
+            self.draw_bar()
+
+    def scroll_pages(self, event, pages):
+        if isinstance(event.widget, (tk.Text, tk.Entry)):
+            return
+        self.scroll_by(pages * max(1, self.scroll_cv.winfo_height() // 20 - 2))
+
+    def on_wheel(self, event):
+        w = event.widget
+        if isinstance(w, str):                     # выпадающий список и т.п.
+            return
+        try:
+            if w.winfo_toplevel() is not self:     # другие окна программы крутят сами себя
+                return
+            if isinstance(w, tk.Text) and w.yview() != (0.0, 1.0):
+                return                             # в списке есть что листать — листаем его
+        except Exception:
+            return
+        self.wheel_acc += event.delta
+        steps = int(self.wheel_acc / 40)
+        self.wheel_acc -= steps * 40
+        self.scroll_by(-steps)
+
+    def bar_press(self, event):
+        a, b = self.scroll_cv.yview()
+        h = max(1, self.sbar.winfo_height())
+        if not a * h <= event.y <= b * h:          # клик мимо ползунка — прыгнуть туда
+            self.scroll_cv.yview_moveto(max(0.0, event.y / h - (b - a) / 2))
+            a = self.scroll_cv.yview()[0]
+            self.draw_bar()
+        self.drag_from = (event.y, a)
+
+    def bar_drag(self, event):
+        if self.drag_from:
+            y0, a0 = self.drag_from
+            self.scroll_cv.yview_moveto(max(0.0, a0 + (event.y - y0) / max(1, self.sbar.winfo_height())))
+            self.draw_bar()
+
     # ── шапка ──
     def build_header(self):
-        cv = tk.Canvas(self, height=92, bg=C["bg"], highlightthickness=0)
+        cv = tk.Canvas(self.body, height=92, bg=C["bg"], highlightthickness=0)
         cv.pack(fill="x")
         self.header = cv
         cv.bind("<Configure>", lambda e: self.draw_header())
@@ -3274,7 +3372,7 @@ class App(tk.Tk):
 
     # ── карточка «сейчас играет» ──
     def build_now_playing(self):
-        outer, box = frame_box(self, "Сейчас звучит")
+        outer, box = frame_box(self.body, "Сейчас звучит")
         outer.pack(fill="x", padx=16, pady=(12, 6))
 
         badge_row = tk.Frame(box, bg=C["panel"])
@@ -3313,7 +3411,7 @@ class App(tk.Tk):
 
     # ── вкладки ──
     def build_tabs(self):
-        bar = tk.Frame(self, bg=C["bg"])
+        bar = tk.Frame(self.body, bg=C["bg"])
         bar.pack(fill="x", padx=16, pady=(6, 0))
         self.tab_btns, self.tabs = {}, {}
         for key, title in (("main", "Главное"), ("status", "Статус"), ("buttons", "Вид"),
@@ -3323,9 +3421,9 @@ class App(tk.Tk):
             lbl.pack(side="left")
             lbl.bind("<Button-1>", lambda e, k=key: self.show_tab(k))
             self.tab_btns[key] = lbl
-        tk.Frame(self, bg=C["gold"], height=1).pack(fill="x", padx=16)
+        tk.Frame(self.body, bg=C["gold"], height=1).pack(fill="x", padx=16)
 
-        holder = tk.Frame(self, bg=C["bg"])
+        holder = tk.Frame(self.body, bg=C["bg"])
         holder.pack(fill="both", expand=True, padx=16, pady=(8, 14))
         self.tabs["main"] = self.build_main_tab(holder)
         self.tabs["status"] = self.build_status_tab(holder)
@@ -3347,6 +3445,7 @@ class App(tk.Tk):
             self.refresh_history()
         elif key == "status":
             self.refresh_presets()
+        self.after_idle(self.layout_scroll)
 
     def entry(self, master, var, width=22):
         return tk.Entry(master, textvariable=var, width=width, font=(SANS, 10), bg=C["bg"],
@@ -4350,9 +4449,20 @@ class App(tk.Tk):
                         self.tray.set_title(APP_NAME)
         except queue.Empty:
             pass
+        if self.body.winfo_reqheight() != self.body_need:
+            self.layout_scroll()
         self.after(200, self.poll)
 
+    def remember_size(self):
+        try:
+            if self.state() == "normal" and self.winfo_height() != self.cfg.get("window_h"):
+                self.cfg["window_h"] = self.winfo_height()
+                save_cfg(self.cfg)
+        except Exception:
+            pass
+
     def on_close(self):
+        self.remember_size()
         if self.tray:                     # крестик прячет в трей
             self.withdraw()
             if not self.cfg.get("tray_hint_shown"):
@@ -4486,6 +4596,7 @@ class App(tk.Tk):
         self.quit_app()
 
     def quit_app(self):
+        self.remember_size()
         if self.tray:
             self.tray.stop()
         if self.hotkey:
