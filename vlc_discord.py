@@ -78,6 +78,7 @@ DEFAULT_CFG = {
     "client_id_vpn": "",        # третье приложение Discord — для карточки VPN
     "vpn_show_server": True,    # показывать название сервера во второй строке
     "vpn_stats": True,          # пинг и трафик за подключение (из NekoBoxP3R)
+    "vpn_not_game": True,       # VPN — не игра: «Соревнуется в NekoBoxP3R», а не «Играет в»
     "ignore_apps": [],
     "fallback_image": "logo",   # ключ картинки из Art Assets в Discord или https-ссылка
     "badge": "none",            # значок в углу обложки: none | logo | app
@@ -1819,7 +1820,9 @@ def build_vpn_activity(st, cfg):
         state = " · ".join(x for x in (server, mode) if x) or "NekoBoxP3R"
     flag = f"https://flagcdn.com/w160/{code.lower()}.png" if len(code) == 2 and code.isalpha() else None
     act = {
-        "type": 0,
+        # У Discord для программ есть только «Играет / Слушает / Смотрит / Соревнуется».
+        # «Играет» спорит с настоящей игрой за место в статусе, поэтому VPN — отдельным видом.
+        "type": 5 if cfg.get("vpn_not_game", True) else 0,
         "name": "NekoBoxP3R",
         "details": fit(details),
         "state": fit(state),
@@ -3943,6 +3946,9 @@ class App(tk.Tk):
         self.tg_vpn_stats = PToggle(box, "Показывать пинг и сколько данных прошло (NekoBoxP3R 0.20.3+)",
                                     self.cfg.get("vpn_stats", True), self.save_vpn_opts)
         self.tg_vpn_stats.pack(fill="x", pady=2)
+        self.tg_vpn_kind = PToggle(box, "VPN — не игра: «Соревнуется в…», отдельно от игр",
+                                   self.cfg.get("vpn_not_game", True), self.save_vpn_opts)
+        self.tg_vpn_kind.pack(fill="x", pady=2)
         nrow = tk.Frame(box, bg=C["panel"])
         nrow.pack(fill="x", pady=(4, 0))
         tk.Label(nrow, text="ID приложения для VPN", bg=C["panel"], fg=C["cream"],
@@ -4037,6 +4043,7 @@ class App(tk.Tk):
         self.cfg["vpn_card"] = self.tg_vpn.value
         self.cfg["vpn_show_server"] = self.tg_vpn_srv.value
         self.cfg["vpn_stats"] = self.tg_vpn_stats.value
+        self.cfg["vpn_not_game"] = self.tg_vpn_kind.value
         if self.tg_vpn.value and not (self.cfg.get("client_id_vpn") or "").strip():
             self.show_window()
             self.help_vpn_id()
@@ -4066,7 +4073,7 @@ class App(tk.Tk):
         messagebox.showinfo("Карточка VPN из NekoBoxP3R",
             "Discord показывает одну карточку на одно приложение, поэтому для VPN нужно своё:\n\n"
             "1. discord.com/developers/applications → New Application → назови «NekoBoxP3R»\n"
-            "   (будет «Играет в NekoBoxP3R»).\n"
+            "   (будет «Соревнуется в NekoBoxP3R» — отдельно от игр).\n"
             "2. Скопируй его Application ID и вставь в поле «ID приложения для VPN» → OK.\n\n"
             "Карточка появляется, когда NekoBoxP3R подключён, и пропадает, когда отключаешься\n"
             "или закрываешь его. Показывает флаг и страну, сервер и режим, время подключения.\n"

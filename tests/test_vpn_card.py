@@ -26,6 +26,8 @@ st = {"connected": True, "country": "DE", "server": "Trojan Germany", "mode": "v
       "version": "0.20.3", "up": 80 * 1024 ** 2, "down": int(1.2 * 1024 ** 3), "ping": 85}
 a = vd.build_vpn_activity(st, {})
 check("крупно — значок", a["assets"]["large_image"], vd.NEKO_LOGO)
+check("VPN — не игра (вид 5, а не «Играет»)", a["type"], 5)
+check("можно вернуть «Играет»", vd.build_vpn_activity(st, {"vpn_not_game": False})["type"], 0)
 check("в углу — флаг", a["assets"]["small_image"], "https://flagcdn.com/w160/de.png")
 check("строка 1", a["details"], "🛡 🇩🇪 Германия · Trojan Germany")
 check("строка 2", a["state"], "📶 85 мс · ↓ 1,2 ГБ ↑ 80 МБ")
